@@ -94,10 +94,11 @@ public final class ManifestService {
         appKey: String?,
         bundleId: String?,
         lang: String? = nil,
+        substitutionData: [String: Any] = [:],
         completion: ((Result<PaywallManifest?, Error>) -> Void)? = nil
     ) {
         let requested = ManifestScope(baseURL: baseUrl, appKey: appKey, appIdentifier: bundleId, platform: "ios",
-                                      lang: lang ?? LocaleSupport.deviceLanguage())
+                                      lang: lang ?? LocaleSupport.deviceLanguage(), priceFingerprint: ManifestScope.fingerprint(substitutionData))
         activate(scope: requested)
 
         let normalizedBase = baseUrl.hasSuffix("/") ? baseUrl : "\(baseUrl)/"
@@ -119,6 +120,7 @@ public final class ManifestService {
         }
 
         var body: [String: Any] = ["platform": "ios", "lang": requested.lang]
+        body["substitutionData"] = substitutionData
         if let ak = appKey, !ak.isEmpty { body["appKey"] = ak }
         if let bid = bundleId, !bid.isEmpty { body["bundleId"] = bid }
         if let h = currentHash, !h.isEmpty { body["hash"] = h }

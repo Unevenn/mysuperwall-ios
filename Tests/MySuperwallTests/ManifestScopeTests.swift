@@ -36,6 +36,19 @@ final class ManifestScopeTests: XCTestCase {
         XCTAssertEqual(key.count, "mysuperwall_manifest_v2_".count + 64)
     }
 
+    func testStorePricePayloadIsolatesCachedHtml() {
+        let usd: [String: Any] = ["pro": ["displayPrice": "$9.99", "currencyCode": "USD"]]
+        let tr: [String: Any] = ["pro": ["displayPrice": "₺99,99", "currencyCode": "TRY"]]
+        let service = ManifestService(userDefaults: freshDefaults("prices"), session: StubURLProtocol.session())
+        let old = ManifestScope(baseURL: "https://mysuperwall.com", appKey: "k", appIdentifier: "app", platform: "ios", lang: "tr", priceFingerprint: ManifestScope.fingerprint(usd))
+        let new = ManifestScope(baseURL: "https://mysuperwall.com", appKey: "k", appIdentifier: "app", platform: "ios", lang: "tr", priceFingerprint: ManifestScope.fingerprint(tr))
+        XCTAssertNotEqual(old, new)
+        XCTAssertNotEqual(old.cacheKey, new.cacheKey)
+        service.activate(scope: old)
+        service.activate(scope: new)
+        XCTAssertNil(service.manifest)
+    }
+
     // MARK: Locale
 
     func testLanguageNormalization() {

@@ -7,6 +7,7 @@ public final class MySuperwall {
     public static let shared = MySuperwall()
 
     private let stateLock = NSLock()
+    private var _productData: [String: Any] = [:]
     private var _appKey: String?
     private var _userId: String?
     private var _baseUrl: String = "https://mysuperwall.com/"
@@ -93,6 +94,7 @@ public final class MySuperwall {
 
         stateLock.lock()
         let userChanged = _userId != resolvedUser
+        _productData = [:]
         _appKey = appKey
         _baseUrl = baseUrl.hasSuffix("/") ? baseUrl : "\(baseUrl)/"
         _userId = resolvedUser
@@ -113,11 +115,29 @@ public final class MySuperwall {
 
     private func makeScopeLocked() -> ManifestScope {
         ManifestScope(baseURL: _baseUrl, appKey: _appKey, appIdentifier: bundleIdentifier,
-                      platform: "ios", lang: _lang)
+                      platform: "ios", lang: _lang, priceFingerprint: ManifestScope.fingerprint(_productData))
     }
 
     private func syncManifest(scope: ManifestScope) {
-        manifestService.syncInBackground(baseUrl: baseUrl, appKey: appKey, bundleId: bundleIdentifier, lang: scope.lang)
+        manifestService.syncInBackground(baseUrl: baseUrl, appKey: appKey, bundleId: bundleIdentifier, lang: scope.lang, substitutionData: locked { _productData })
+    }
+
+    /// Re-renders cached paywalls with localized store product prices. Wait for completion
+    /// before presenting on a first installation; this SDK does not fetch billing products itself.
+    public func setProductData(_ products: [String: Any], completion: ((Result<PaywallManifest?, Error>) -> Void)? = nil) {
+        guard JSONSerialization.isValidJSONObject(products),
+              let data = try? JSONSerialization.data(withJSONObject: products),
+              let snapshot = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            completion?(.failure(URLError(.cannotDecodeContentData))); return
+        }
+        stateLock.lock()
+        _productData = snapshot
+        let scope = makeScopeLocked()
+        let url = _baseUrl, key = _appKey
+        stateLock.unlock()
+        manifestService.activate(scope: scope)
+        manifestService.syncInBackground(baseUrl: url, appKey: key, bundleId: bundleIdentifier,
+            lang: scope.lang, substitutionData: snapshot, completion: completion)
     }
 
     /// Changes the manifest language. Pending follow-ups are cancelled, the cache for the new

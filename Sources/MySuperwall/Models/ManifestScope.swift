@@ -44,14 +44,21 @@ public struct ManifestScope: Equatable, Hashable {
     public let appKey: String
     public let appIdentifier: String
     public let platform: String
+    public let priceFingerprint: String
     public let lang: String
 
-    public init(baseURL: String, appKey: String?, appIdentifier: String?, platform: String, lang: String) {
+    public init(baseURL: String, appKey: String?, appIdentifier: String?, platform: String, lang: String, priceFingerprint: String = "") {
         self.baseURL = ManifestScope.normalizeBaseURL(baseURL)
         self.appKey = (appKey ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         self.appIdentifier = (appIdentifier ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        self.priceFingerprint = priceFingerprint
         self.platform = platform.lowercased()
         self.lang = LocaleSupport.normalizeLanguage(lang) ?? "en"
+    }
+
+    static func fingerprint(_ products: [String: Any]) -> String {
+        guard !products.isEmpty, let data = try? JSONSerialization.data(withJSONObject: products, options: [.sortedKeys]) else { return "" }
+        return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
     /// Lowercases scheme/host, drops default ports, query, fragment and trailing slashes.
@@ -93,6 +100,6 @@ public struct ManifestScope: Equatable, Hashable {
         let data = (try? encoder.encode(Canonical(v: 1, baseURL: baseURL, appKey: appKey,
                                                    appIdentifier: appIdentifier, platform: platform, lang: lang))) ?? Data()
         let hex = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
-        return "mysuperwall_manifest_v2_\(hex)"
+        return "mysuperwall_manifest_v2_\(hex)" + (priceFingerprint.isEmpty ? "" : "_prices_" + priceFingerprint)
     }
 }

@@ -15,7 +15,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.1.0**:
+select **Up to Next Major Version** starting at **1.2.0**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -24,7 +24,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.1.0")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.2.0")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
@@ -171,3 +171,19 @@ Behaviour:
 
 Offline analytics queues are isolated by server and app scope. Unscoped legacy queues
 are retained on disk but never sent under a new app identity.
+
+## Localized store prices (1.2.0+)
+
+This SDK does not query StoreKit, Google Play Billing or RevenueCat products itself.
+Initialize the existing billing provider and fetch its products first. Build a map
+keyed by the exact store product ID. Each value must contain `displayPrice`,
+`priceString` and `currencyCode` from the store. Supply `subscriptionPeriod` and
+store-derived `pricePerDayText`, `pricePerWeekText`, `pricePerMonthText`,
+`pricePerYearText` where the template uses them. Never convert a USD catalog price
+using device locale or exchange rates. Storefront determines the currency.
+
+Call `setProductData` after SDK initialization and before presenting. Await its
+completion (Promise on React Native, callback on native platforms) and refresh it
+when store product prices change. Missing live product data is not proof that
+catalog/default prices are localized. Wait for successful manifest loading on a
+first installation. Existing displayed paywalls are not silently replaced.
