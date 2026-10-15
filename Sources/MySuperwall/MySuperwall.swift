@@ -1,0 +1,379 @@
+import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
+
+public final class MySuperwall {
+    public static let shared = MySuperwall()
+
+    private let stateLock = NSLock()
+    private var _appKey: String?
+    private var _userId: String?
+    private var _baseUrl: String = "https://mysuperwall.com/"
+    private var _userAttributes: [String: Any] = [:]
+    private var _lang: String = LocaleSupport.deviceLanguage()
+    private var _countryOverride: String?
+    private var _subscriptionStatus: SubscriptionStatus = .unknown
+    private var _isConfigured = false
+
+    public var appKey: String? { locked { _appKey } }
+    public var userId: String? { locked { _userId } }
+    public var baseUrl: String { locked { _baseUrl } }
+    public var userAttributes: [String: Any] { locked { _userAttributes } }
+    /// Language used for the manifest request and cache scope (e.g. "en").
+    public var lang: String { locked { _lang } }
+    /// Country used for audience rules: the explicit override, else the device region.
+    public var country: String? { locked { _countryOverride } ?? LocaleSupport.deviceCountry() }
+    public var subscriptionStatus: SubscriptionStatus { locked { _subscriptionStatus } }
+
+    public let manifestService: ManifestService
+    public let ruleEngine: LocalRuleEngine
+    public let eventQueue: OfflineEventQueue
+
+    private let userDefaults: UserDefaults
+    private let bundleIdentifier: String?
+    private(set) var followUps: FollowUpController!
+
+    init(
+        manifestService: ManifestService = ManifestService(),
+        ruleEngine: LocalRuleEngine = LocalRuleEngine(),
+        eventQueue: OfflineEventQueue = OfflineEventQueue(),
+        userDefaults: UserDefaults = .standard,
+        bundleIdentifier: String? = Bundle.main.bundleIdentifier,
+        followUpScheduler: ((TimeInterval, @escaping () -> Void) -> () -> Void)? = nil
+    ) {
+        self.manifestService = manifestService
+        self.ruleEngine = ruleEngine
+        self.eventQueue = eventQueue
+        self.userDefaults = userDefaults
+        self.bundleIdentifier = bundleIdentifier
+
+        var env = FollowUpController.Environment(
+            manifest: { [weak manifestService] in manifestService?.manifest },
+            isPremium: { [weak self] in self?.subscriptionStatus == .active },
+            userId: { [weak self] in self?.userId },
+            resolveTrigger: { [weak self] key in
+                self?.resolveTrigger(triggerKey: key) ?? PaywallResult(show: false)
+            }
+        )
+        if let scheduler = followUpScheduler { env.schedule = scheduler }
+        self.followUps = FollowUpController(environment: env)
+    }
+
+    private func locked<T>(_ body: () -> T) -> T {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return body()
+    }
+
+    /// Initializes MySuperwall with an instant disk load of this scope's cache and a background sync.
+    /// Calling it again re-scopes safely: stale in-memory data is dropped and in-flight work is ignored.
+    /// - Parameters:
+    ///   - locale: explicit language (e.g. "tr", "pt-BR" -> "pt"); defaults to the device language.
+    ///   - country: optional region override for audience rules; never affects the language.
+    public static func initialize(
+        appKey: String? = nil,
+        userId: String? = nil,
+        baseUrl: String = "https://mysuperwall.com/",
+        locale: String? = nil,
+        country: String? = nil
+    ) {
+        shared.configure(appKey: appKey, userId: userId, baseUrl: baseUrl, locale: locale, country: country)
+    }
+
+    func configure(appKey: String?, userId: String?, baseUrl: String, locale: String?, country: String?) {
+        let resolvedUser: String
+        if let uid = userId, !uid.isEmpty {
+            resolvedUser = uid
+        } else if let cached = userDefaults.string(forKey: "mysuperwall_user_id_v1") {
+            resolvedUser = cached
+        } else {
+            resolvedUser = UUID().uuidString
+            userDefaults.set(resolvedUser, forKey: "mysuperwall_user_id_v1")
+        }
+
+        stateLock.lock()
+        let userChanged = _userId != resolvedUser
+        _appKey = appKey
+        _baseUrl = baseUrl.hasSuffix("/") ? baseUrl : "\(baseUrl)/"
+        _userId = resolvedUser
+        _lang = LocaleSupport.normalizeLanguage(locale) ?? LocaleSupport.deviceLanguage()
+        _countryOverride = LocaleSupport.normalizeCountry(country)
+        _isConfigured = true
+        if userChanged { _subscriptionStatus = .unknown }
+        let scope = makeScopeLocked()
+        stateLock.unlock()
+
+        // 1. Switch scope: clears memory first, then loads only this scope's disk entry.
+        let scopeChanged = manifestService.activate(scope: scope)
+        if scopeChanged || userChanged { followUps.reset() }
+
+        // 2. Background sync with ETag / 304 validation.
+        syncManifest(scope: scope)
+    }
+
+    private func makeScopeLocked() -> ManifestScope {
+        ManifestScope(baseURL: _baseUrl, appKey: _appKey, appIdentifier: bundleIdentifier,
+                      platform: "ios", lang: _lang)
+    }
+
+    private func syncManifest(scope: ManifestScope) {
+        manifestService.syncInBackground(baseUrl: baseUrl, appKey: appKey, bundleId: bundleIdentifier, lang: scope.lang)
+    }
+
+    /// Changes the manifest language. Pending follow-ups are cancelled, the cache for the new
+    /// language is loaded (never the previous language's), and a background refresh starts.
+    /// `nil` (or an unparseable value) restores the device language.
+    public func setLocale(_ locale: String?) {
+        stateLock.lock()
+        let resolved = LocaleSupport.normalizeLanguage(locale) ?? LocaleSupport.deviceLanguage()
+        guard resolved != _lang else { stateLock.unlock(); return }
+        _lang = resolved
+        let configured = _isConfigured
+        let scope = makeScopeLocked()
+        stateLock.unlock()
+
+        guard configured else { return }
+        followUps.reset()
+        manifestService.activate(scope: scope)
+        syncManifest(scope: scope)
+    }
+
+    /// Overrides the country used for audience rules (ISO 3166-1 alpha-2). `nil` restores the
+    /// device region. Does not change the language or the manifest cache scope.
+    public func setCountry(_ country: String?) {
+        stateLock.lock()
+        _countryOverride = LocaleSupport.normalizeCountry(country)
+        stateLock.unlock()
+    }
+
+    /// Host-reported entitlement, consulted by follow-up rules with `skipIfPremium`. Reset to
+    /// `.unknown` whenever the user identity changes.
+    public func setSubscriptionStatus(_ status: SubscriptionStatus) {
+        stateLock.lock()
+        _subscriptionStatus = status
+        stateLock.unlock()
+    }
+
+    /// Set authenticated or persistent user ID
+    public func identify(userId: String) {
+        stateLock.lock()
+        let changed = _userId != userId
+        _userId = userId
+        if changed { _subscriptionStatus = .unknown }
+        stateLock.unlock()
+        userDefaults.set(userId, forKey: "mysuperwall_user_id_v1")
+        if changed { followUps.reset() }
+    }
+
+    /// Set persistent custom user attributes for audience rule evaluation
+    public func setUserAttributes(_ attributes: [String: Any]) {
+        stateLock.lock()
+        _userAttributes.merge(attributes) { _, new in new }
+        stateLock.unlock()
+    }
+
+    /// Evaluates rules locally and resolves the paywall result with 0 ms latency.
+    public func resolveTrigger(
+        triggerKey: String,
+        metadata: [String: Any]? = nil
+    ) -> PaywallResult {
+        guard let manifest = manifestService.manifest,
+              let trigger = manifest.findTrigger(triggerKey) else {
+            return PaywallResult(show: false, paywall: nil, reason: "manifest_or_trigger_not_found")
+        }
+
+        let currentUser = userId
+        var evalContext: [String: Any] = [
+            "platform": "ios",
+            "country": country ?? Locale.current.identifier,
+            "lang": lang,
+            "metadata": metadata ?? [:],
+            "userAttributes": userAttributes
+        ]
+        if let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String {
+            evalContext["appVersion"] = version
+        }
+        if let meta = metadata {
+            evalContext.merge(meta) { _, new in new }
+        }
+
+        let resolution = ruleEngine.resolveTrigger(
+            trigger: trigger,
+            userId: currentUser,
+            context: evalContext
+        )
+
+        if resolution.isHoldout {
+            return PaywallResult(show: false, paywall: nil, reason: "holdout")
+        }
+
+        if resolution.show, let paywallId = resolution.paywallId, let manifestPaywall = manifest.paywalls[paywallId] {
+            let paywallData = PaywallData(
+                id: manifestPaywall.id,
+                name: manifestPaywall.name,
+                html: manifestPaywall.html,
+                productIds: manifestPaywall.productIds,
+                products: manifestPaywall.products,
+                triggerKey: triggerKey,
+                abVariant: resolution.abVariant,
+                experimentContext: experimentContext(trigger: trigger, resolution: resolution, paywall: manifestPaywall),
+                attributionUserId: currentUser,
+                attributionScope: manifestService.scope?.cacheKey
+            )
+
+            return PaywallResult(show: true, paywall: paywallData, reason: resolution.reason)
+        }
+
+        return PaywallResult(show: false, paywall: nil, reason: resolution.reason)
+    }
+
+    private func experimentContext(trigger: ManifestTrigger, resolution: RuleEngineResolution, paywall: ManifestPaywall) -> ExperimentContext? {
+        let rule = resolution.matchedRuleId.flatMap { id in trigger.rules.first { $0.id == id } }
+        let variants = rule?.variants ?? trigger.variants
+        let matches = variants.filter { $0.paywallId == paywall.id && $0.variant == resolution.abVariant }
+        guard matches.count == 1, let variant = matches.first,
+              let variantId = variant.variantId,
+              let experimentId = rule != nil ? rule?.experimentId : trigger.experimentId,
+              let version = rule != nil ? rule?.experimentVersion : trigger.experimentVersion,
+              let audience = rule != nil ? rule?.audienceId : trigger.audienceId,
+              let paywallVersion = paywall.publishedVersion else { return nil }
+        return ExperimentContext(experimentId: experimentId, experimentVersion: version,
+                                 audienceId: audience, variantId: variantId,
+                                 variantLabel: variant.variantLabel ?? variant.variant,
+                                 paywallId: paywall.id, paywallVersion: paywallVersion)
+    }
+
+    /// Use the displayed paywall, never a freshly resolved assignment.
+    ///
+    /// Host-confirmed outcomes (`purchase`, `purchase_success`, `purchase_failed`, `restore`,
+    /// `restore_success`) additionally arm the matching `followUpRules` entry of the paywall that is
+    /// currently shown by the SDK; the follow-up only presents after that paywall is dismissed.
+    public func trackPaywallEvent(type: String, paywall: PaywallData, productId: String? = nil) {
+        if let scope = paywall.attributionScope, scope != manifestService.scope?.cacheKey { return }
+        if let user = paywall.attributionUserId, user != userId { return }
+        let currentUser = userId
+        var event: [String: Any] = ["type": type, "eventId": UUID().uuidString,
+                                  "paywallId": paywall.id, "triggerKey": paywall.triggerKey ?? "",
+                                  "abVariant": paywall.abVariant ?? "", "userId": currentUser ?? ""]
+        if paywall.attributionUserId == currentUser, let context = paywall.experimentContext { event["experimentContext"] = context.dictionary }
+        if let productId = productId { event["productId"] = productId }
+        eventQueue.enqueue(event: event, scope: ManifestScope(baseURL: baseUrl, appKey: appKey, appIdentifier: bundleIdentifier, platform: "ios", lang: "en"))
+        flushEventQueue()
+        followUps.recordSignal(type: type, paywall: paywall)
+    }
+
+    #if canImport(UIKit)
+    private weak var activeController: PaywallWebViewController?
+
+    /// Triggers a paywall event and automatically presents it over the specified controller with 0 ms network wait.
+    /// `onDismiss` is invoked exactly once per presented paywall (including automatic follow-ups).
+    @discardableResult
+    public func handleTrigger(
+        presentingController: UIViewController?,
+        triggerKey: String,
+        metadata: [String: Any]? = nil,
+        onPurchase: ((String) -> Void)? = nil,
+        onRestore: (() -> Void)? = nil,
+        onDismiss: (() -> Void)? = nil,
+        onOpenUrl: ((URL) -> Void)? = nil
+    ) -> PaywallResult {
+        let result = resolveTrigger(triggerKey: triggerKey, metadata: metadata)
+
+        guard result.show, let paywall = result.paywall, let presenter = presentingController else {
+            return result
+        }
+
+        let callbacks = PaywallCallbacks(onPurchase: onPurchase, onRestore: onRestore,
+                                         onDismiss: onDismiss, onOpenUrl: onOpenUrl)
+        DispatchQueue.main.async { [weak self, weak presenter] in
+            guard let self = self, let presenter = presenter else { return }
+            _ = self.present(paywall: paywall, depth: 0, chain: [paywall.id], presenter: presenter, callbacks: callbacks)
+        }
+
+        return result
+    }
+
+    /// Dismisses the paywall currently shown by the SDK, if any. The normal dismissal path runs
+    /// (callback once, pending follow-up evaluated after the UI is gone).
+    public func dismissActivePaywall(animated: Bool = true) {
+        DispatchQueue.main.async { [weak self] in
+            self?.activeController?.dismiss(animated: animated, completion: nil)
+        }
+    }
+
+    /// Main thread only.
+    private func present(paywall: PaywallData, depth: Int, chain: [String],
+                         presenter: UIViewController, callbacks: PaywallCallbacks) -> Bool {
+        let session = followUps.begin(paywall: paywall, depth: depth, chain: chain)
+        let delegate = ClosurePaywallDelegate(callbacks: callbacks) { [weak self, weak presenter] in
+            guard let self = self else { return }
+            self.followUps.sessionDidClose(
+                session,
+                hostValid: { MySuperwall.isValidHost(presenter) },
+                present: { [weak self] next in
+                    guard let self = self, let presenter = presenter else { return false }
+                    return self.present(paywall: next.paywall, depth: next.depth, chain: next.chain,
+                                        presenter: presenter, callbacks: callbacks)
+                }
+            )
+        }
+        let controller = PaywallWebViewController(paywall: paywall, delegate: delegate)
+        // Retain delegate for controller lifecycle
+        objc_setAssociatedObject(controller, &MySuperwall.delegateKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+        activeController = controller
+        presenter.present(controller, animated: true, completion: nil)
+        return true
+    }
+
+    private static var delegateKey: UInt8 = 0
+
+    /// The old UI must be gone and the host screen must still be on screen and free to present.
+    private static func isValidHost(_ presenter: UIViewController?) -> Bool {
+        guard let presenter = presenter else { return false }
+        return presenter.viewIfLoaded?.window != nil
+            && presenter.presentedViewController == nil
+            && !presenter.isBeingDismissed
+            && !presenter.isBeingPresented
+    }
+    #endif
+
+    private func flushEventQueue() {
+        eventQueue.flush(baseUrl: baseUrl, appKey: appKey, bundleId: bundleIdentifier)
+    }
+}
+
+#if canImport(UIKit)
+private struct PaywallCallbacks {
+    let onPurchase: ((String) -> Void)?
+    let onRestore: (() -> Void)?
+    let onDismiss: (() -> Void)?
+    let onOpenUrl: ((URL) -> Void)?
+}
+
+private final class ClosurePaywallDelegate: PaywallDelegate {
+    private let callbacks: PaywallCallbacks
+    private let onClosed: () -> Void
+
+    init(callbacks: PaywallCallbacks, onClosed: @escaping () -> Void) {
+        self.callbacks = callbacks
+        self.onClosed = onClosed
+    }
+
+    func paywallDidRequestPurchase(productId: String) {
+        callbacks.onPurchase?(productId)
+    }
+
+    func paywallDidRequestRestore() {
+        callbacks.onRestore?()
+    }
+
+    func paywallDidDismiss() {
+        callbacks.onDismiss?()
+        onClosed()
+    }
+
+    func paywallDidOpenUrl(url: URL) {
+        callbacks.onOpenUrl?(url)
+    }
+}
+#endif
