@@ -6,6 +6,14 @@ public final class OfflineEventQueue {
     private let queueKey = "mysuperwall_offline_event_queue_v1"
     private let lock = NSLock()
     private var isFlushing = false
+    private var generation = 0
+    private var inFlight: URLSessionDataTask?
+
+    public func cancelPending() {
+        lock.lock(); defer { lock.unlock() }
+        generation += 1
+        inFlight?.cancel(); inFlight = nil; isFlushing = false
+    }
 
     public init(userDefaults: UserDefaults = .standard, session: URLSession = .shared) {
         self.userDefaults = userDefaults
@@ -45,6 +53,7 @@ public final class OfflineEventQueue {
             return
         }
         isFlushing = true
+        let capturedGeneration = generation
         let list = loadRawQueue(key: key)
         lock.unlock()
 
@@ -88,6 +97,7 @@ public final class OfflineEventQueue {
         let task = session.dataTask(with: request) { [weak self] data, response, error in
             guard let self = self else { return }
             self.lock.lock()
+            guard self.generation == capturedGeneration else { self.lock.unlock(); return }
             defer {
                 self.isFlushing = false
                 self.lock.unlock()
@@ -108,6 +118,10 @@ public final class OfflineEventQueue {
             self.saveRawQueue(current, key: key)
             completion?(batch.count)
         }
+        lock.lock()
+        guard generation == capturedGeneration else { lock.unlock(); task.cancel(); return }
+        inFlight = task
+        lock.unlock()
         task.resume()
     }
 

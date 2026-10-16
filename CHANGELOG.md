@@ -1,3 +1,12 @@
+## 1.3.0
+
+- Add configurable SDK log levels, defaulting to warnings and errors.
+- Remove the public custom base URL initialization option; use the fixed MySuperWall service endpoint.
+- Add per-trigger paywall lifecycle state observation.
+- Guard against duplicate presentations and stale visibility callbacks.
+- Count impressions once per displayed session after WebView paint readiness and foreground visibility checks.
+- Add explicit SDK cleanup for pending recovery and manifest work.
+
 # Changelog
 
 ## 1.2.0 - 2026-10-15

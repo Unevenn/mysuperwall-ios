@@ -26,6 +26,10 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     private var didTrackDismiss = false
     private var didNotifyDismiss = false
     private var htmlLoaded = false
+    private var appeared = false
+    private var loadFailed = false
+    private var foregroundObserver: NSObjectProtocol?
+
     private let messageHandlerName = "MySuperWall"
 
     public init(paywall: PaywallData, delegate: PaywallDelegate? = nil) {
@@ -44,15 +48,20 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
         view.backgroundColor = .black
         setupWebView()
         loadPaywallHtml()
+        foregroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.trackShownIfReady() }
     }
 
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
+        appeared = true
         trackShownIfReady()
     }
 
     public override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
+        appeared = false
         // Covers dismissals not initiated by the page's close action (host code, system).
         // Merely being covered by another presentation is not a dismissal.
         guard isBeingDismissed || isMovingFromParent else { return }
@@ -63,6 +72,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     private func notifyDismissedOnce() {
         guard !didNotifyDismiss else { return }
         didNotifyDismiss = true
+        MySuperwall.shared.updatePaywallState(paywall, .dismissed)
         if !didTrackDismiss && didTrackShown {
             didTrackDismiss = true
             MySuperwall.shared.trackPaywallEvent(type: "paywall_dismissed", paywall: paywall)
@@ -71,14 +81,28 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     }
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        htmlLoaded = true
-        trackShownIfReady()
+        guard !loadFailed else { return }
+        MySuperwall.shared.updatePaywallState(paywall, .ready)
+        webView.evaluateJavaScript("requestAnimationFrame(function(){requestAnimationFrame(function(){window.webkit.messageHandlers.MySuperWall.postMessage({action:'__msw_painted'});});});")
+
     }
 
     private func trackShownIfReady() {
-        guard htmlLoaded, view.window != nil, !didTrackShown else { return }
+        guard htmlLoaded, appeared, !loadFailed, !didNotifyDismiss,
+              !isBeingDismissed, presentedViewController == nil,
+              UIApplication.shared.applicationState == .active,
+              view.window != nil, !didTrackShown else { return }
         didTrackShown = true
+        MySuperwall.shared.updatePaywallState(paywall, .visible)
         MySuperwall.shared.trackPaywallEvent(type: "paywall_shown", paywall: paywall)
+    }
+
+    public func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { failLoad() }
+    public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failLoad() }
+    private func failLoad() {
+        loadFailed = true
+        MySuperwall.shared.updatePaywallState(paywall, .failed)
+        MySuperwallLogging.warning("Paywall navigation failed.")
     }
 
     private func setupWebView() {
@@ -116,6 +140,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     }
 
     private func loadPaywallHtml() {
+        MySuperwall.shared.updatePaywallState(paywall, .loading)
         webView.loadHTMLString(paywall.html, baseURL: URL(string: "https://mysuperwall.com"))
     }
 
@@ -137,7 +162,11 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
 
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
+            guard !self.didNotifyDismiss else { return }
             switch type {
+            case "__msw_painted":
+                self.htmlLoaded = true
+                self.trackShownIfReady()
             case "purchase":
                 let productId = (payload["productId"] as? String) ??
                                 (payload["product_id"] as? String) ?? ""
@@ -169,6 +198,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     }
 
     deinit {
+        if let observer = foregroundObserver { NotificationCenter.default.removeObserver(observer) }
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
     }
 }

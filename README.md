@@ -15,7 +15,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.2.0**:
+select **Up to Next Major Version** starting at **1.1.0**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -24,7 +24,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.2.0")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.1.0")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
@@ -187,3 +187,20 @@ completion (Promise on React Native, callback on native platforms) and refresh i
 when store product prices change. Missing live product data is not proof that
 catalog/default prices are localized. Wait for successful manifest loading on a
 first installation. Existing displayed paywalls are not silently replaced.
+
+## Lifecycle and logging (1.3.0+)
+
+```swift
+MySuperwall.initialize(appKey: "YOUR_APP_KEY", logLevel: .warning)
+MySuperwall.shared.onPaywallStateChanged = { trigger, state in
+    // Update your application's state on the main queue.
+}
+let state = MySuperwall.shared.paywallState(for: "location")
+MySuperwall.shared.logLevel = .none
+// On SDK teardown: MySuperwall.shared.dispose()
+```
+
+Log levels: `all`, `warning` (default), `error`, `none`. States: `idle`, `loading`,
+`ready`, `presenting`, `visible`, `dismissed`, `failed`. The `baseUrl` initialization
+argument was removed; remove it from existing integrations. Impressions require
+WebView paint readiness and a visible, foreground presentation.

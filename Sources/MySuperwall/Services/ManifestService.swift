@@ -18,6 +18,13 @@ public final class ManifestService {
     private var _generation = 0
     private var inFlight: URLSessionDataTask?
 
+    public func dispose() {
+        lock.lock(); defer { lock.unlock() }
+        _generation += 1
+        inFlight?.cancel(); inFlight = nil
+        _manifest = nil; _scope = nil
+    }
+
     public var manifest: PaywallManifest? {
         lock.lock(); defer { lock.unlock() }
         return _manifest
@@ -73,7 +80,7 @@ public final class ManifestService {
         do {
             return try JSONDecoder().decode(PaywallManifest.self, from: data)
         } catch {
-            print("[MySuperwall] Failed to decode cached manifest from disk: \(error)")
+            MySuperwallLogging.warning("Failed to decode cached manifest from disk: \(error)")
             return nil
         }
     }
@@ -82,7 +89,7 @@ public final class ManifestService {
         do {
             userDefaults.set(try JSONEncoder().encode(manifest), forKey: scope.cacheKey)
         } catch {
-            print("[MySuperwall] Failed to persist manifest to disk: \(error)")
+            MySuperwallLogging.warning("Failed to persist manifest to disk: \(error)")
         }
     }
 

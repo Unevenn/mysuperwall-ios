@@ -16,10 +16,48 @@ public final class MySuperwall {
     private var _countryOverride: String?
     private var _subscriptionStatus: SubscriptionStatus = .unknown
     private var _isConfigured = false
+    private var _paywallStates: [String: PaywallState] = [:]
+    private var _presentationPending = false
+    private var _configurationGeneration = 0
+    public var onPaywallStateChanged: ((String, PaywallState) -> Void)?
+    public var logLevel: MySuperwallLogLevel {
+        get { MySuperwallLogging.level }
+        set { MySuperwallLogging.level = newValue }
+    }
+    public func paywallState(for triggerKey: String) -> PaywallState {
+        locked { _paywallStates[triggerKey] ?? .idle }
+    }
+    func updatePaywallState(_ paywall: PaywallData, _ state: PaywallState) {
+        if let scope = paywall.attributionScope, scope != manifestService.scope?.cacheKey { return }
+        if let user = paywall.attributionUserId, user != userId { return }
+        let key = paywall.triggerKey ?? paywall.id
+        let changed = locked { () -> Bool in
+            guard _isConfigured, _paywallStates[key] != state else { return false }
+            _paywallStates[key] = state
+            return true
+        }
+        if changed {
+            DispatchQueue.main.async { [weak self] in self?.onPaywallStateChanged?(key, state) }
+        }
+    }
+
+    public func dispose() {
+        followUps.reset()
+        manifestService.dispose()
+        eventQueue.cancelPending()
+        locked { _configurationGeneration += 1; _isConfigured = false; _paywallStates.removeAll(); _presentationPending = false }
+        #if canImport(UIKit)
+        DispatchQueue.main.async { [weak self] in
+            self?.activeController?.dismiss(animated: false)
+            self?.activeController = nil
+        }
+        #endif
+        onPaywallStateChanged = nil
+    }
 
     public var appKey: String? { locked { _appKey } }
     public var userId: String? { locked { _userId } }
-    public var baseUrl: String { locked { _baseUrl } }
+    private var baseUrl: String { locked { _baseUrl } }
     public var userAttributes: [String: Any] { locked { _userAttributes } }
     /// Language used for the manifest request and cache scope (e.g. "en").
     public var lang: String { locked { _lang } }
@@ -74,11 +112,12 @@ public final class MySuperwall {
     public static func initialize(
         appKey: String? = nil,
         userId: String? = nil,
-        baseUrl: String = "https://mysuperwall.com/",
         locale: String? = nil,
-        country: String? = nil
+        country: String? = nil,
+        logLevel: MySuperwallLogLevel = .warning
     ) {
-        shared.configure(appKey: appKey, userId: userId, baseUrl: baseUrl, locale: locale, country: country)
+        MySuperwallLogging.level = logLevel
+        shared.configure(appKey: appKey, userId: userId, baseUrl: "https://mysuperwall.com/", locale: locale, country: country)
     }
 
     func configure(appKey: String?, userId: String?, baseUrl: String, locale: String?, country: String?) {
@@ -101,6 +140,7 @@ public final class MySuperwall {
         _lang = LocaleSupport.normalizeLanguage(locale) ?? LocaleSupport.deviceLanguage()
         _countryOverride = LocaleSupport.normalizeCountry(country)
         _isConfigured = true
+        _configurationGeneration += 1
         if userChanged { _subscriptionStatus = .unknown }
         let scope = makeScopeLocked()
         stateLock.unlock()
@@ -269,6 +309,7 @@ public final class MySuperwall {
     /// `restore_success`) additionally arm the matching `followUpRules` entry of the paywall that is
     /// currently shown by the SDK; the follow-up only presents after that paywall is dismissed.
     public func trackPaywallEvent(type: String, paywall: PaywallData, productId: String? = nil) {
+        guard locked({ _isConfigured }) else { return }
         if let scope = paywall.attributionScope, scope != manifestService.scope?.cacheKey { return }
         if let user = paywall.attributionUserId, user != userId { return }
         let currentUser = userId
@@ -297,17 +338,29 @@ public final class MySuperwall {
         onDismiss: (() -> Void)? = nil,
         onOpenUrl: ((URL) -> Void)? = nil
     ) -> PaywallResult {
+        let reserved = locked { () -> Bool in
+            guard _isConfigured, !_presentationPending else { return false }
+            _presentationPending = true
+            return true
+        }
+        guard reserved else { return PaywallResult(show: false, reason: "presentation_in_progress") }
+        let generation = locked { _configurationGeneration }
         let result = resolveTrigger(triggerKey: triggerKey, metadata: metadata)
 
         guard result.show, let paywall = result.paywall, let presenter = presentingController else {
+            locked { _presentationPending = false }
             return result
         }
 
         let callbacks = PaywallCallbacks(onPurchase: onPurchase, onRestore: onRestore,
                                          onDismiss: onDismiss, onOpenUrl: onOpenUrl)
         DispatchQueue.main.async { [weak self, weak presenter] in
-            guard let self = self, let presenter = presenter else { return }
-            _ = self.present(paywall: paywall, depth: 0, chain: [paywall.id], presenter: presenter, callbacks: callbacks)
+            guard let self = self else { return }
+            guard self.locked({ self._isConfigured && self._configurationGeneration == generation }) else { return }
+            guard let presenter = presenter else { self.locked { self._presentationPending = false }; return }
+            if !self.present(paywall: paywall, depth: 0, chain: [paywall.id], presenter: presenter, callbacks: callbacks) {
+                self.locked { self._presentationPending = false }
+            }
         }
 
         return result
@@ -324,9 +377,14 @@ public final class MySuperwall {
     /// Main thread only.
     private func present(paywall: PaywallData, depth: Int, chain: [String],
                          presenter: UIViewController, callbacks: PaywallCallbacks) -> Bool {
+        guard locked({ _isConfigured }), Self.isValidHost(presenter),
+              activeController?.viewIfLoaded?.window == nil else { return false }
+        locked { _presentationPending = true }
         let session = followUps.begin(paywall: paywall, depth: depth, chain: chain)
         let delegate = ClosurePaywallDelegate(callbacks: callbacks) { [weak self, weak presenter] in
             guard let self = self else { return }
+            self.activeController = nil
+            self.locked { self._presentationPending = false }
             self.followUps.sessionDidClose(
                 session,
                 hostValid: { MySuperwall.isValidHost(presenter) },
@@ -341,6 +399,7 @@ public final class MySuperwall {
         // Retain delegate for controller lifecycle
         objc_setAssociatedObject(controller, &MySuperwall.delegateKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         activeController = controller
+        updatePaywallState(paywall, .presenting)
         presenter.present(controller, animated: true, completion: nil)
         return true
     }
