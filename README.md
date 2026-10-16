@@ -15,7 +15,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.1.0**:
+select **Up to Next Major Version** starting at **1.3.0**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -24,7 +24,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.1.0")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.3.0")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
