@@ -15,7 +15,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.3.0**:
+select **Up to Next Major Version** starting at **1.4.0**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -24,7 +24,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.3.0")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.4.0")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
@@ -76,6 +76,37 @@ MySuperwall.shared.handleTrigger(
 )
 ```
 
+### Prepare once at startup (1.4.0+)
+
+Do the expensive work once, not before every presentation:
+
+```swift
+// 1. App launch: configure with the app's language (default = device language).
+MySuperwall.initialize(appKey: "YOUR_APP_KEY", locale: "tr")
+
+// 2. Once, when your billing provider has loaded store prices (and again only if they change).
+MySuperwall.shared.setProductData(products) { _ in
+    // 3. Load the main paywall off-screen so the next trigger presents instantly.
+    MySuperwall.shared.prewarm(triggerKey: "onboarding_finish")
+}
+
+// Later, anywhere: presents the already-loaded paywall when it still matches.
+MySuperwall.shared.handleTrigger(presentingController: self, triggerKey: "onboarding_finish")
+```
+
+- **Do not call `setLocale` or `setProductData` right before each `handleTrigger`.** Language and
+  prices are part of the manifest cache scope; changing them starts a network refresh. Unchanged
+  product data is a no-op (no request; the completion receives the current manifest) and a bare
+  language already covered by the current one (`"tr"` while the device language is `"tr-tr"`)
+  is ignored, but neither is free of work and neither belongs on the presentation path.
+- `prewarm(triggerKey:metadata:)` keeps **one** prepared `WKWebView`. A new call replaces the
+  target. It is rebuilt automatically after manifest, language, product-data or user changes and
+  after the prepared paywall has been shown; it is released on memory warnings, `dispose()` and
+  `releasePrewarmedPaywall()`. A prepared paywall is used only when the trigger resolves to the
+  same paywall with the same rendered HTML; otherwise a fresh one is built as before.
+  `handleTrigger` callbacks, lifecycle states and impression tracking are unchanged; nothing is
+  reported for the off-screen preparation itself.
+
 ### 3. User Attributes & Identification
 
 ```swift
@@ -115,8 +146,8 @@ Verified revenue remains a separate backend/provider concern.
 ## Language, country and cache isolation
 
 ```swift
-MySuperwall.initialize(appKey: "KEY", locale: "tr")   // optional; default = device language
-MySuperwall.shared.setLocale("pt-BR")                 // -> lang "pt-br"; nil = device language
+MySuperwall.initialize(appKey: "KEY", locale: "tr")   // preferred; default = device language
+MySuperwall.shared.setLocale("pt-BR")                 // runtime change only; nil = device language
 MySuperwall.shared.setCountry("DE")                   // audience-rule country only; nil = device region
 ```
 
@@ -126,6 +157,13 @@ MySuperwall.shared.setCountry("DE")                   // audience-rule country o
   `baseURL / appKey / bundle id / platform / lang` (the raw app key is never stored in a key).
   Changing any of them clears the in-memory manifest first and loads only that scope's entry.
   The old unscoped cache entry is never read (and is removed).
+- Set the language once with `initialize(locale:)`. Use `setLocale` only when the user actually
+  changes the app language.
+- A bare language already covered by the active one (`setLocale("tr")` while `"tr-tr"` is active)
+  is a no-op. Switching to a regional variant of the same language (`"tr"` -> `"tr-tr"`) with no
+  cache for it yet keeps serving the current paywalls from memory until that scope's refresh
+  succeeds (the old hash is not sent, nothing is written under the new key). A different language
+  or a different price payload never reuses the previous manifest.
 - `setLocale` and a repeated `initialize` cancel pending follow-ups, reload the matching cache and
   refresh in the background. Responses (including `304`) that return after the scope changed are
   discarded and cannot write memory or disk.
@@ -182,9 +220,10 @@ store-derived `pricePerDayText`, `pricePerWeekText`, `pricePerMonthText`,
 `pricePerYearText` where the template uses them. Never convert a USD catalog price
 using device locale or exchange rates. Storefront determines the currency.
 
-Call `setProductData` after SDK initialization and before presenting. Await its
-completion (Promise on React Native, callback on native platforms) and refresh it
-when store product prices change. Missing live product data is not proof that
+Call `setProductData` once after SDK initialization, when the store prices have loaded
+(not before every presentation). Await its completion (Promise on React Native, callback
+on native platforms) and call it again only when store product prices change; an
+unchanged payload makes no request and completes with the current manifest. Missing live product data is not proof that
 catalog/default prices are localized. Wait for successful manifest loading on a
 first installation. Existing displayed paywalls are not silently replaced.
 

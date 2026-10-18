@@ -42,6 +42,9 @@ public final class MySuperwall {
     }
 
     public func dispose() {
+        #if canImport(UIKit)
+        onMain { self.prewarmTarget = nil; self.releasePrewarmedController() }
+        #endif
         followUps.reset()
         manifestService.dispose()
         eventQueue.cancelPending()
@@ -97,6 +100,9 @@ public final class MySuperwall {
         )
         if let scheduler = followUpScheduler { env.schedule = scheduler }
         self.followUps = FollowUpController(environment: env)
+        #if canImport(UIKit)
+        manifestService.onManifestChange = { [weak self] in self?.schedulePrewarmRefresh() }
+        #endif
     }
 
     private func locked<T>(_ body: () -> T) -> T {
@@ -106,8 +112,9 @@ public final class MySuperwall {
 
     /// Initializes MySuperwall with an instant disk load of this scope's cache and a background sync.
     /// Calling it again re-scopes safely: stale in-memory data is dropped and in-flight work is ignored.
+    /// Call it once at startup with the app's language; that is the intended way to set the locale.
     /// - Parameters:
-    ///   - locale: explicit language (e.g. "tr", "pt-BR" -> "pt"); defaults to the device language.
+    ///   - locale: explicit language (e.g. "tr", "pt-BR"); defaults to the device language.
     ///   - country: optional region override for audience rules; never affects the language.
     public static func initialize(
         appKey: String? = nil,
@@ -162,8 +169,11 @@ public final class MySuperwall {
         manifestService.syncInBackground(baseUrl: baseUrl, appKey: appKey, bundleId: bundleIdentifier, lang: scope.lang, substitutionData: locked { _productData })
     }
 
-    /// Re-renders cached paywalls with localized store product prices. Wait for completion
-    /// before presenting on a first installation; this SDK does not fetch billing products itself.
+    /// Re-renders cached paywalls with localized store product prices. Call it once when the
+    /// store prices load (not before every presentation). Wait for completion before presenting
+    /// on a first installation; this SDK does not fetch billing products itself.
+    /// Unchanged products are a no-op: no request is made and `completion` receives the
+    /// current manifest.
     public func setProductData(_ products: [String: Any], completion: ((Result<PaywallManifest?, Error>) -> Void)? = nil) {
         guard JSONSerialization.isValidJSONObject(products),
               let data = try? JSONSerialization.data(withJSONObject: products),
@@ -171,21 +181,32 @@ public final class MySuperwall {
             completion?(.failure(URLError(.cannotDecodeContentData))); return
         }
         stateLock.lock()
+        let unchanged = ManifestScope.fingerprint(snapshot) == ManifestScope.fingerprint(_productData)
         _productData = snapshot
         let scope = makeScopeLocked()
         let url = _baseUrl, key = _appKey
         stateLock.unlock()
+        // Skip only when the active scope already serves this exact payload with its own manifest;
+        // with nothing cached yet, a sync is still needed for the caller awaiting completion.
+        if unchanged, manifestService.scope == scope, !manifestService.isServingProvisionalManifest,
+           let current = manifestService.manifest {
+            completion?(.success(current)); return
+        }
         manifestService.activate(scope: scope)
         manifestService.syncInBackground(baseUrl: url, appKey: key, bundleId: bundleIdentifier,
             lang: scope.lang, substitutionData: snapshot, completion: completion)
     }
 
-    /// Changes the manifest language. Pending follow-ups are cancelled, the cache for the new
-    /// language is loaded (never the previous language's), and a background refresh starts.
-    /// `nil` (or an unparseable value) restores the device language.
+    /// Changes the manifest language at runtime (prefer `initialize(locale:)` at startup).
+    /// Pending follow-ups are cancelled, the cache for the new language is loaded, and a
+    /// background refresh starts. `nil` (or an unparseable value) restores the device language.
+    /// A bare language already covered by the current one ("tr" while "tr-tr" is active) is a
+    /// no-op; a regional variant of the same language keeps the current paywalls until the
+    /// refresh completes. A different language never shows the previous language's paywalls.
     public func setLocale(_ locale: String?) {
         stateLock.lock()
-        let resolved = LocaleSupport.normalizeLanguage(locale) ?? LocaleSupport.deviceLanguage()
+        let requested = LocaleSupport.normalizeLanguage(locale) ?? LocaleSupport.deviceLanguage()
+        let resolved = LocaleSupport.isSatisfied(requested: requested, by: _lang) ? _lang : requested
         guard resolved != _lang else { stateLock.unlock(); return }
         _lang = resolved
         let configured = _isConfigured
@@ -222,7 +243,12 @@ public final class MySuperwall {
         if changed { _subscriptionStatus = .unknown }
         stateLock.unlock()
         userDefaults.set(userId, forKey: "mysuperwall_user_id_v1")
-        if changed { followUps.reset() }
+        if changed {
+            followUps.reset()
+            #if canImport(UIKit)
+            schedulePrewarmRefresh()
+            #endif
+        }
     }
 
     /// Set persistent custom user attributes for audience rule evaluation
@@ -385,6 +411,7 @@ public final class MySuperwall {
             guard let self = self else { return }
             self.activeController = nil
             self.locked { self._presentationPending = false }
+            self.schedulePrewarmRefresh()
             self.followUps.sessionDidClose(
                 session,
                 hostValid: { MySuperwall.isValidHost(presenter) },
@@ -395,13 +422,95 @@ public final class MySuperwall {
                 }
             )
         }
-        let controller = PaywallWebViewController(paywall: paywall, delegate: delegate)
+        let warm = takePrewarmedController(for: paywall)
+        let controller = warm ?? PaywallWebViewController(paywall: paywall, delegate: delegate)
         // Retain delegate for controller lifecycle
         objc_setAssociatedObject(controller, &MySuperwall.delegateKey, delegate, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
         activeController = controller
         updatePaywallState(paywall, .presenting)
+        warm?.activatePrewarmed(paywall: paywall, delegate: delegate)
         presenter.present(controller, animated: true, completion: nil)
         return true
+    }
+
+    // MARK: Prewarm (single slot, main thread only)
+
+    private var prewarmTarget: (triggerKey: String, metadata: [String: Any]?)?
+    private var prewarmedController: PaywallWebViewController?
+    private var memoryWarningObserver: NSObjectProtocol?
+    private var prewarmRefreshScheduled = false
+
+    /// Resolves `triggerKey` now and loads its paywall off-screen, so the next `handleTrigger`
+    /// that resolves to the same paywall (same id and rendered HTML) presents instantly.
+    /// Call once at startup for the main trigger, after `initialize`. One slot only: a new call
+    /// replaces the previous target. The slot is rebuilt automatically after manifest, locale,
+    /// product-data or user changes and after the prepared paywall has been shown, and is
+    /// released on memory warnings. A stale prepared paywall is never presented.
+    public func prewarm(triggerKey: String, metadata: [String: Any]? = nil) {
+        onMain {
+            self.prewarmTarget = (triggerKey, metadata)
+            self.observeMemoryWarnings()
+            self.refreshPrewarm()
+        }
+    }
+
+    /// Drops the prepared paywall and stops rebuilding it.
+    public func releasePrewarmedPaywall() {
+        onMain { self.prewarmTarget = nil; self.releasePrewarmedController() }
+    }
+
+    /// The paywall currently prepared off-screen (main thread; for diagnostics and tests).
+    var prewarmedPaywall: PaywallData? { prewarmedController?.paywall }
+
+    func schedulePrewarmRefresh() {
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.prewarmTarget != nil, !self.prewarmRefreshScheduled else { return }
+            self.prewarmRefreshScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.prewarmRefreshScheduled = false
+                self.refreshPrewarm()
+            }
+        }
+    }
+
+    /// Main thread only. Keeps the slot when it still matches the current resolution, otherwise rebuilds it.
+    func refreshPrewarm() {
+        guard let target = prewarmTarget, locked({ _isConfigured }) else { releasePrewarmedController(); return }
+        // Building a second WebView under a visible paywall is wasted memory; refreshed on dismissal.
+        guard activeController == nil else { return }
+        let result = resolveTrigger(triggerKey: target.triggerKey, metadata: target.metadata)
+        guard result.show, let paywall = result.paywall else { releasePrewarmedController(); return }
+        if let current = prewarmedController, current.isReusablePrewarm,
+           PrewarmPolicy.canReuse(prepared: current.paywall, for: paywall) { return }
+        releasePrewarmedController()
+        let controller = PaywallWebViewController(paywall: paywall, delegate: nil, prewarmed: true)
+        controller.loadViewIfNeeded()
+        prewarmedController = controller
+    }
+
+    private func takePrewarmedController(for paywall: PaywallData) -> PaywallWebViewController? {
+        guard let warm = prewarmedController else { return nil }
+        prewarmedController = nil
+        guard warm.isReusablePrewarm, PrewarmPolicy.canReuse(prepared: warm.paywall, for: paywall) else {
+            return nil // stale or failed: discarded, a fresh controller is built instead
+        }
+        return warm
+    }
+
+    private func releasePrewarmedController() {
+        prewarmedController = nil
+    }
+
+    private func observeMemoryWarnings() {
+        guard memoryWarningObserver == nil else { return }
+        memoryWarningObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.releasePrewarmedController() }
+    }
+
+    private func onMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread { work() } else { DispatchQueue.main.async(execute: work) }
     }
 
     private static var delegateKey: UInt8 = 0

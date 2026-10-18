@@ -17,12 +17,21 @@ public final class ManifestService {
     /// Bumped on every scope change; in-flight requests compare it before applying anything.
     private var _generation = 0
     private var inFlight: URLSessionDataTask?
+    /// True while `_manifest` is the previous scope's manifest, carried over because the new
+    /// scope is only a regional variant of the same language ("tr-tr" -> "tr") and has no disk
+    /// entry yet. It lives in memory only and is replaced by the first sync for the new scope.
+    private var _isProvisional = false
+    /// Called (on an arbitrary thread, outside the lock) whenever the in-memory manifest may
+    /// have changed. Used to rebuild the prewarmed paywall.
+    var onManifestChange: (() -> Void)?
 
     public func dispose() {
-        lock.lock(); defer { lock.unlock() }
+        lock.lock()
         _generation += 1
         inFlight?.cancel(); inFlight = nil
-        _manifest = nil; _scope = nil
+        _manifest = nil; _scope = nil; _isProvisional = false
+        lock.unlock()
+        onManifestChange?()
     }
 
     public var manifest: PaywallManifest? {
@@ -35,6 +44,13 @@ public final class ManifestService {
         return _scope
     }
 
+    /// True while the previous language variant's manifest is being served until the active
+    /// scope's own sync completes.
+    var isServingProvisionalManifest: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return _isProvisional
+    }
+
     public init(userDefaults: UserDefaults = .standard, session: URLSession = .shared) {
         self.userDefaults = userDefaults
         self.session = session
@@ -43,36 +59,53 @@ public final class ManifestService {
     /// Switches to `scope`. On a change, the in-memory manifest is dropped first, in-flight
     /// work is invalidated, and only that scope's own disk entry is loaded. Returns true when
     /// the scope changed.
+    ///
+    /// Exception: when the new scope differs from the previous one only by a regional variant
+    /// of the same language ("tr-tr" <-> "tr") and has no disk entry yet, the previous manifest
+    /// keeps being served (memory only) until the new scope's sync succeeds, so a paywall does
+    /// not silently disappear. Other languages, prices and apps never carry over.
     @discardableResult
     public func activate(scope newScope: ManifestScope) -> Bool {
-        lock.lock(); defer { lock.unlock() }
-        if _scope == newScope { return false }
+        lock.lock()
+        if _scope == newScope { lock.unlock(); return false }
+        let previous = _manifest, previousScope = _scope
         _generation += 1
         _manifest = nil
+        _isProvisional = false
         inFlight?.cancel()
         inFlight = nil
         _scope = newScope
         _manifest = readDisk(for: newScope)
+        if _manifest == nil, let previous = previous, let old = previousScope, old.isLanguageVariant(of: newScope) {
+            _manifest = previous
+            _isProvisional = true
+        }
         userDefaults.removeObject(forKey: legacyStorageKey)
+        lock.unlock()
+        onManifestChange?()
         return true
     }
 
     /// Synchronously (re)loads the active scope's cached manifest from disk (0 ms latency).
     @discardableResult
     public func loadFromDisk() -> PaywallManifest? {
-        lock.lock(); defer { lock.unlock() }
-        guard let scope = _scope else { return nil }
+        lock.lock()
+        guard let scope = _scope else { lock.unlock(); return nil }
         let decoded = readDisk(for: scope)
-        if let decoded = decoded { _manifest = decoded }
+        if let decoded = decoded { _manifest = decoded; _isProvisional = false }
+        lock.unlock()
+        if decoded != nil { onManifestChange?() }
         return decoded
     }
 
     /// Persists manifest to disk under the active scope.
     public func saveToDisk(_ manifest: PaywallManifest) {
-        lock.lock(); defer { lock.unlock() }
-        guard let scope = _scope else { _manifest = manifest; return }
+        lock.lock()
         _manifest = manifest
-        writeDisk(manifest, for: scope)
+        _isProvisional = false
+        if let scope = _scope { writeDisk(manifest, for: scope) }
+        lock.unlock()
+        onManifestChange?()
     }
 
     private func readDisk(for scope: ManifestScope) -> PaywallManifest? {
@@ -116,7 +149,8 @@ public final class ManifestService {
 
         lock.lock()
         let generation = _generation
-        let currentHash = _manifest?.hash
+        // A provisional manifest belongs to another scope: its hash must not validate this one.
+        let currentHash = _isProvisional ? nil : _manifest?.hash
         lock.unlock()
 
         var request = URLRequest(url: url)
@@ -178,8 +212,10 @@ public final class ManifestService {
                 }
                 // Memory and disk are updated atomically with the generation check.
                 self._manifest = decoded
+                self._isProvisional = false
                 self.writeDisk(decoded, for: scope)
                 self.lock.unlock()
+                self.onManifestChange?()
                 completion?(.success(decoded))
             } catch {
                 completion?(.failure(current() ? error : ManifestSyncError.staleScope as Error))

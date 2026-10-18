@@ -19,7 +19,7 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 
 public final class PaywallWebViewController: UIViewController, WKScriptMessageHandler, WKNavigationDelegate {
     public weak var delegate: PaywallDelegate?
-    public let paywall: PaywallData
+    public private(set) var paywall: PaywallData
 
     private var webView: WKWebView!
     private var didTrackShown = false
@@ -28,15 +28,45 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     private var htmlLoaded = false
     private var appeared = false
     private var loadFailed = false
+    private var navigationFinished = false
+    /// Loaded off-screen by `MySuperwall.prewarm`; reports no state and handles no page actions
+    /// until `activatePrewarmed` hands it to a real presentation.
+    private var isPrewarming = false
     private var foregroundObserver: NSObjectProtocol?
 
     private let messageHandlerName = "MySuperWall"
 
-    public init(paywall: PaywallData, delegate: PaywallDelegate? = nil) {
+    public convenience init(paywall: PaywallData, delegate: PaywallDelegate? = nil) {
+        self.init(paywall: paywall, delegate: delegate, prewarmed: false)
+    }
+
+    init(paywall: PaywallData, delegate: PaywallDelegate?, prewarmed: Bool) {
         self.paywall = paywall
         self.delegate = delegate
+        self.isPrewarming = prewarmed
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
+    }
+
+    /// A prepared controller that loaded without error and was never handed out.
+    var isReusablePrewarm: Bool {
+        isPrewarming && !loadFailed && presentingViewController == nil && parent == nil
+    }
+
+    /// Hands a prewarmed controller to a presentation. `paywall` carries this presentation's
+    /// attribution (trigger, variant, user, scope); its id and HTML match the loaded page.
+    func activatePrewarmed(paywall: PaywallData, delegate: PaywallDelegate?) {
+        guard isPrewarming else { return }
+        self.paywall = paywall
+        self.delegate = delegate
+        isPrewarming = false
+        report(.loading)
+        if navigationFinished { report(.ready) }
+    }
+
+    private func report(_ state: PaywallState) {
+        guard !isPrewarming else { return }
+        MySuperwall.shared.updatePaywallState(paywall, state)
     }
 
     required init?(coder: NSCoder) {
@@ -56,6 +86,8 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         appeared = true
+        // A page loaded off-screen may not have painted yet; probe again now that it is visible.
+        if navigationFinished && !htmlLoaded { requestPaintSignal() }
         trackShownIfReady()
     }
 
@@ -72,7 +104,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     private func notifyDismissedOnce() {
         guard !didNotifyDismiss else { return }
         didNotifyDismiss = true
-        MySuperwall.shared.updatePaywallState(paywall, .dismissed)
+        report(.dismissed)
         if !didTrackDismiss && didTrackShown {
             didTrackDismiss = true
             MySuperwall.shared.trackPaywallEvent(type: "paywall_dismissed", paywall: paywall)
@@ -82,13 +114,17 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
 
     public func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard !loadFailed else { return }
-        MySuperwall.shared.updatePaywallState(paywall, .ready)
-        webView.evaluateJavaScript("requestAnimationFrame(function(){requestAnimationFrame(function(){window.webkit.messageHandlers.MySuperWall.postMessage({action:'__msw_painted'});});});")
+        navigationFinished = true
+        report(.ready)
+        requestPaintSignal()
+    }
 
+    private func requestPaintSignal() {
+        webView.evaluateJavaScript("requestAnimationFrame(function(){requestAnimationFrame(function(){window.webkit.messageHandlers.MySuperWall.postMessage({action:'__msw_painted'});});});")
     }
 
     private func trackShownIfReady() {
-        guard htmlLoaded, appeared, !loadFailed, !didNotifyDismiss,
+        guard !isPrewarming, htmlLoaded, appeared, !loadFailed, !didNotifyDismiss,
               !isBeingDismissed, presentedViewController == nil,
               UIApplication.shared.applicationState == .active,
               view.window != nil, !didTrackShown else { return }
@@ -101,7 +137,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failLoad() }
     private func failLoad() {
         loadFailed = true
-        MySuperwall.shared.updatePaywallState(paywall, .failed)
+        report(.failed)
         MySuperwallLogging.warning("Paywall navigation failed.")
     }
 
@@ -140,7 +176,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     }
 
     private func loadPaywallHtml() {
-        MySuperwall.shared.updatePaywallState(paywall, .loading)
+        report(.loading)
         webView.loadHTMLString(paywall.html, baseURL: URL(string: "https://mysuperwall.com"))
     }
 
@@ -163,6 +199,8 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             guard !self.didNotifyDismiss else { return }
+            // Off-screen pages may only signal paint; actions need a real presentation.
+            guard !self.isPrewarming || type == "__msw_painted" else { return }
             switch type {
             case "__msw_painted":
                 self.htmlLoaded = true

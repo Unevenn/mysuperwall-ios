@@ -25,6 +25,17 @@ public enum LocaleSupport {
         return upper
     }
 
+    /// Primary language subtag: "tr-tr" -> "tr", "pt-br" -> "pt".
+    public static func baseLanguage(_ tag: String) -> String {
+        String(tag.split(separator: "-", maxSplits: 1).first ?? Substring(tag))
+    }
+
+    /// True when `requested` is a bare language ("tr") that `current` ("tr-tr") already
+    /// satisfies, so switching would only lose the cache without changing the paywall language.
+    static func isSatisfied(requested: String, by current: String) -> Bool {
+        !requested.contains("-") && baseLanguage(current) == requested
+    }
+
     /// Device preferred language, falling back to the current locale and finally "en".
     public static func deviceLanguage() -> String {
         if let preferred = normalizeLanguage(Locale.preferredLanguages.first) { return preferred }
@@ -54,6 +65,13 @@ public struct ManifestScope: Equatable, Hashable {
         self.priceFingerprint = priceFingerprint
         self.platform = platform.lowercased()
         self.lang = LocaleSupport.normalizeLanguage(lang) ?? "en"
+    }
+
+    /// Same app, platform and prices; only a regional variant of the same language differs.
+    func isLanguageVariant(of other: ManifestScope) -> Bool {
+        baseURL == other.baseURL && appKey == other.appKey && appIdentifier == other.appIdentifier
+            && platform == other.platform && priceFingerprint == other.priceFingerprint
+            && lang != other.lang && LocaleSupport.baseLanguage(lang) == LocaleSupport.baseLanguage(other.lang)
     }
 
     static func fingerprint(_ products: [String: Any]) -> String {
