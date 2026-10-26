@@ -15,7 +15,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.4.0**:
+select **Up to Next Major Version** starting at **1.5.0**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -24,7 +24,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.4.0")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.5.0")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
@@ -76,7 +76,7 @@ MySuperwall.shared.handleTrigger(
 )
 ```
 
-### Prepare once at startup (1.4.0+)
+### Prepare once at startup (1.5.0+)
 
 Do the expensive work once, not before every presentation:
 
@@ -142,6 +142,31 @@ Do not resolve the trigger again to attribute a completed purchase. An identity
 change invalidates attribution from the previous user's paywall. Offline retries
 retain the original event ID and context; events are removed by acknowledged ID.
 Verified revenue remains a separate backend/provider concern.
+
+## Push notifications (optional, 1.5.0+)
+
+Connect your Firebase project under **Integrations → Push notifications** in the dashboard, then create notifications under **Notifications**. The SDK has no Firebase dependency: your app reads the FCM token and hands it over. Enable the Push Notifications capability and the Remote notifications background mode, and upload your APNs key to Firebase.
+
+```swift
+// MessagingDelegate: called with the token and again whenever it refreshes
+func messaging(_ messaging: Messaging, didReceiveRegistrationToken token: String?) {
+    if let token { MySuperwall.shared.setPushToken(token) }
+}
+
+// UNUserNotificationCenterDelegate: the user tapped a notification
+func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                            withCompletionHandler done: @escaping () -> Void) {
+    MySuperwall.shared.handleNotificationOpened(
+        presentingController: topViewController(),
+        userInfo: response.notification.request.content.userInfo)
+    done()
+}
+```
+
+- The token is registered for the current user and language and registered again by itself after `identify` / `setLocale` (at most once a day otherwise). The notification text is chosen from that language.
+- `trackNotificationOpened(userInfo:)` only reports the tap and returns the trigger key, for apps that present paywalls themselves. `MySuperwall.isMySuperwallNotification(_:)` tells these messages from your own.
+- Call `prewarm` for the trigger or wait for startup work to finish before presenting a tapped notification's paywall.
+- `clearPushToken()` stops notifications for the device. People who just bought are skipped on the server.
 
 ## Language, country and cache isolation
 

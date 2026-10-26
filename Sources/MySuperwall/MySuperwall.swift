@@ -74,6 +74,7 @@ public final class MySuperwall {
 
     private let userDefaults: UserDefaults
     private let bundleIdentifier: String?
+    private let pushRegistrar: PushRegistrar
     private(set) var followUps: FollowUpController!
 
     init(
@@ -82,13 +83,15 @@ public final class MySuperwall {
         eventQueue: OfflineEventQueue = OfflineEventQueue(),
         userDefaults: UserDefaults = .standard,
         bundleIdentifier: String? = Bundle.main.bundleIdentifier,
-        followUpScheduler: ((TimeInterval, @escaping () -> Void) -> () -> Void)? = nil
+        followUpScheduler: ((TimeInterval, @escaping () -> Void) -> () -> Void)? = nil,
+        pushTransport: PushTransport? = nil
     ) {
         self.manifestService = manifestService
         self.ruleEngine = ruleEngine
         self.eventQueue = eventQueue
         self.userDefaults = userDefaults
         self.bundleIdentifier = bundleIdentifier
+        self.pushRegistrar = PushRegistrar(defaults: userDefaults, transport: pushTransport ?? URLSessionPushTransport(baseUrl: { MySuperwall.shared.baseUrlForPush }))
 
         var env = FollowUpController.Environment(
             manifest: { [weak manifestService] in manifestService?.manifest },
@@ -158,6 +161,9 @@ public final class MySuperwall {
 
         // 2. Background sync with ETag / 304 validation.
         syncManifest(scope: scope)
+
+        // 3. A token saved by an earlier session is registered again (at most once a day).
+        pushRegistrar.sync(identity: pushIdentity())
     }
 
     private func makeScopeLocked() -> ManifestScope {
@@ -217,6 +223,7 @@ public final class MySuperwall {
         followUps.reset()
         manifestService.activate(scope: scope)
         syncManifest(scope: scope)
+        pushRegistrar.sync(identity: pushIdentity(), force: true)
     }
 
     /// Overrides the country used for audience rules (ISO 3166-1 alpha-2). `nil` restores the
@@ -245,11 +252,76 @@ public final class MySuperwall {
         userDefaults.set(userId, forKey: "mysuperwall_user_id_v1")
         if changed {
             followUps.reset()
+            pushRegistrar.sync(identity: pushIdentity(), force: true)
             #if canImport(UIKit)
             schedulePrewarmRefresh()
             #endif
         }
     }
+
+    // MARK: - Push notifications
+
+    var baseUrlForPush: String { baseUrl }
+
+    private func pushIdentity() -> PushIdentity {
+        PushIdentity(appKey: appKey, bundleId: bundleIdentifier, userId: userId, locale: lang,
+                     appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                     utcOffsetMinutes: TimeZone.current.secondsFromGMT() / 60)
+    }
+
+    /// Registers this device's FCM token so notifications from the MySuperwall dashboard (for example "come
+    /// back" reminders after a paywall was closed) can reach it. The SDK has no Firebase dependency: read the
+    /// token with `Messaging.messaging().token` (or `messaging(_:didReceiveRegistrationToken:)`) after the user
+    /// allowed notifications and pass it here, again whenever the token refreshes. It is registered for the
+    /// current user and language, and again after `identify` or `setLocale`.
+    public func setPushToken(_ token: String) {
+        pushRegistrar.set(token, identity: pushIdentity())
+    }
+
+    /// Stops notifications for this device, for example when the user turns them off or logs out.
+    public func clearPushToken() {
+        pushRegistrar.clear(identity: pushIdentity())
+    }
+
+    /// `true` when a push message was sent by MySuperwall (its payload carries the `mysuperwall` marker).
+    public static func isMySuperwallNotification(_ userInfo: [AnyHashable: Any]?) -> Bool {
+        guard let marker = userInfo?["mysuperwall"] else { return false }
+        return "\(marker)" == "1"
+    }
+
+    /// Reports that the user tapped a MySuperwall notification and returns the trigger key chosen for it in
+    /// the dashboard, or `nil` when the message is not from MySuperwall or names no trigger. Pass the
+    /// notification's `userInfo` from `userNotificationCenter(_:didReceive:)`.
+    @discardableResult
+    public func trackNotificationOpened(userInfo: [AnyHashable: Any]) -> String? {
+        guard Self.isMySuperwallNotification(userInfo) else { return nil }
+        if let jobId = userInfo["jobId"] as? String, !jobId.isEmpty {
+            pushRegistrar.reportOpened(jobId: jobId, identity: pushIdentity())
+        }
+        let key = (userInfo["triggerKey"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return key.isEmpty ? nil : key
+    }
+
+    #if canImport(UIKit)
+    /// `trackNotificationOpened` plus `handleTrigger`: reports the tap and shows the paywall of the
+    /// notification's trigger. Returns `false` when the message is not from MySuperwall.
+    @discardableResult
+    public func handleNotificationOpened(
+        presentingController: UIViewController?,
+        userInfo: [AnyHashable: Any],
+        onPurchase: ((String) -> Void)? = nil,
+        onRestore: (() -> Void)? = nil,
+        onDismiss: (() -> Void)? = nil,
+        onOpenUrl: ((URL) -> Void)? = nil
+    ) -> Bool {
+        guard Self.isMySuperwallNotification(userInfo) else { return false }
+        if let key = trackNotificationOpened(userInfo: userInfo) {
+            handleTrigger(presentingController: presentingController, triggerKey: key, metadata: ["source": "notification"],
+                          onPurchase: onPurchase, onRestore: onRestore, onDismiss: onDismiss, onOpenUrl: onOpenUrl)
+        }
+        return true
+    }
+    #endif
 
     /// Set persistent custom user attributes for audience rule evaluation
     public func setUserAttributes(_ attributes: [String: Any]) {

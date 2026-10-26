@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.0 - 2026-10-26
+
+- Add optional push notifications: `setPushToken(_:)` / `clearPushToken()` register the app's FCM token for the current user and language (no Firebase dependency in the SDK), `trackNotificationOpened(userInfo:)` reports a tap and returns the trigger to open, and `handleNotificationOpened(presentingController:userInfo:)` also presents it.
+
 ## 1.4.0 - 2026-10-18
 
 - Add `prewarm(triggerKey:metadata:)`: one paywall is resolved and loaded off-screen so the next
