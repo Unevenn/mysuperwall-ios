@@ -154,6 +154,7 @@ public final class ManifestService {
         lock.unlock()
 
         var request = URLRequest(url: url)
+        request.timeoutInterval = 10
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         if let h = currentHash, !h.isEmpty {
@@ -191,7 +192,7 @@ public final class ManifestService {
                 return
             }
             guard (200...299).contains(httpResponse.statusCode), let data = data else {
-                completion?(current() ? .success(self.manifest) : .failure(ManifestSyncError.staleScope))
+                completion?(.failure(URLError(.badServerResponse)))
                 return
             }
 

@@ -1,3 +1,9 @@
+## 1.5.1 - 2026-10-30
+
+- Revalidate before presentation/prewarming and stop cached or native fallback delivery when a trigger/paywall is disabled or the server cannot be reached.
+- Keep current handleTrigger call syntax; its immediate result is validation_pending. Observe the final result via onResult; React Native also provides handleTriggerAsync.
+- Pause hidden/backgrounded CSS/Web Animations, animation-frame loops and media without blocking SDK paint readiness. Preserve host/presenter lifecycle and reject stale requests after identity, locale or product-data changes.
+
 # Changelog
 
 ## 1.5.0 - 2026-10-26

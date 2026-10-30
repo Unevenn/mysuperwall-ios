@@ -188,6 +188,7 @@ public final class MySuperwall {
         }
         stateLock.lock()
         let unchanged = ManifestScope.fingerprint(snapshot) == ManifestScope.fingerprint(_productData)
+        if !unchanged { _configurationGeneration += 1; _presentationPending = false }
         _productData = snapshot
         let scope = makeScopeLocked()
         let url = _baseUrl, key = _appKey
@@ -214,6 +215,8 @@ public final class MySuperwall {
         let requested = LocaleSupport.normalizeLanguage(locale) ?? LocaleSupport.deviceLanguage()
         let resolved = LocaleSupport.isSatisfied(requested: requested, by: _lang) ? _lang : requested
         guard resolved != _lang else { stateLock.unlock(); return }
+        _configurationGeneration += 1
+        _presentationPending = false
         _lang = resolved
         let configured = _isConfigured
         let scope = makeScopeLocked()
@@ -247,7 +250,7 @@ public final class MySuperwall {
         stateLock.lock()
         let changed = _userId != userId
         _userId = userId
-        if changed { _subscriptionStatus = .unknown }
+        if changed { _subscriptionStatus = .unknown; _configurationGeneration += 1; _presentationPending = false }
         stateLock.unlock()
         userDefaults.set(userId, forKey: "mysuperwall_user_id_v1")
         if changed {
@@ -434,46 +437,84 @@ public final class MySuperwall {
         onPurchase: ((String) -> Void)? = nil,
         onRestore: (() -> Void)? = nil,
         onDismiss: (() -> Void)? = nil,
-        onOpenUrl: ((URL) -> Void)? = nil
+        onOpenUrl: ((URL) -> Void)? = nil,
+        onResult: ((PaywallResult) -> Void)? = nil
     ) -> PaywallResult {
         let reserved = locked { () -> Bool in
             guard _isConfigured, !_presentationPending else { return false }
             _presentationPending = true
+            _configurationGeneration += 1
             return true
         }
-        guard reserved else { return PaywallResult(show: false, reason: "presentation_in_progress") }
-        let generation = locked { _configurationGeneration }
-        let result = resolveTrigger(triggerKey: triggerKey, metadata: metadata)
-
-        guard result.show, let paywall = result.paywall, let presenter = presentingController else {
-            locked { _presentationPending = false }
+        guard reserved else {
+            let result = PaywallResult(show: false, reason: "presentation_in_progress")
+            onResult?(result)
             return result
         }
-
-        let callbacks = PaywallCallbacks(onPurchase: onPurchase, onRestore: onRestore,
-                                         onDismiss: onDismiss, onOpenUrl: onOpenUrl)
-        DispatchQueue.main.async { [weak self, weak presenter] in
+        let generation = locked { _configurationGeneration }
+        syncDelivery { [weak self, weak presentingController] fresh in
             guard let self = self else { return }
-            guard self.locked({ self._isConfigured && self._configurationGeneration == generation }) else { return }
-            guard let presenter = presenter else { self.locked { self._presentationPending = false }; return }
-            if !self.present(paywall: paywall, depth: 0, chain: [paywall.id], presenter: presenter, callbacks: callbacks) {
+            guard self.locked({ self._isConfigured && self._configurationGeneration == generation }) else {
+                onResult?(PaywallResult(show: false, reason: "identity_changed")); return
+            }
+            let result = fresh ? self.resolveTrigger(triggerKey: triggerKey, metadata: metadata)
+                : PaywallResult(show: false, reason: "network_unavailable")
+            guard result.show, let paywall = result.paywall, let presenter = presentingController else {
+                self.releasePrewarmedController()
                 self.locked { self._presentationPending = false }
+                onResult?(result.show ? PaywallResult(show: false, reason: "presenter_unavailable") : result)
+                return
+            }
+            let callbacks = PaywallCallbacks(onPurchase: onPurchase, onRestore: onRestore,
+                                             onDismiss: onDismiss, onOpenUrl: onOpenUrl)
+            let shown = self.presentValidated(paywall: paywall, depth: 0, chain: [paywall.id], presenter: presenter, callbacks: callbacks)
+            if !shown { self.locked { self._presentationPending = false } }
+            onResult?(shown ? result : PaywallResult(show: false, reason: "presenter_unavailable"))
+        }
+        // The final decision arrives through onResult; this is not a no-display decision.
+        return PaywallResult(show: false, reason: "validation_pending")
+    }
+
+    private func syncDelivery(_ completion: @escaping (Bool) -> Void) {
+        let generation = locked { _configurationGeneration }
+        manifestService.syncInBackground(baseUrl: baseUrl, appKey: appKey,
+            bundleId: bundleIdentifier, lang: lang, substitutionData: locked { _productData }) { [weak self] outcome in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                guard self.locked({ self._isConfigured && self._configurationGeneration == generation }) else { completion(false); return }
+                if case .success(let manifest) = outcome { completion(manifest?.ok == true) }
+                else { completion(false) }
             }
         }
-
-        return result
     }
 
     /// Dismisses the paywall currently shown by the SDK, if any. The normal dismissal path runs
     /// (callback once, pending follow-up evaluated after the UI is gone).
     public func dismissActivePaywall(animated: Bool = true) {
         DispatchQueue.main.async { [weak self] in
-            self?.activeController?.dismiss(animated: animated, completion: nil)
+            guard let self = self else { return }
+            if self.activeController == nil {
+                self.locked { self._configurationGeneration += 1; self._presentationPending = false }
+            }
+            self.activeController?.dismiss(animated: animated, completion: nil)
         }
     }
 
     /// Main thread only.
     private func present(paywall: PaywallData, depth: Int, chain: [String],
+                         presenter: UIViewController, callbacks: PaywallCallbacks) -> Bool {
+        syncDelivery { [weak self, weak presenter] fresh in
+            guard let self = self, let presenter = presenter, fresh,
+                  let manifest = self.manifestService.manifest,
+                  let triggerKey = paywall.triggerKey,
+                  manifest.findTrigger(triggerKey) != nil,
+                  let current = manifest.paywalls[paywall.id], current.html == paywall.html else { return }
+            _ = self.presentValidated(paywall: paywall, depth: depth, chain: chain, presenter: presenter, callbacks: callbacks)
+        }
+        return true
+    }
+
+    private func presentValidated(paywall: PaywallData, depth: Int, chain: [String],
                          presenter: UIViewController, callbacks: PaywallCallbacks) -> Bool {
         guard locked({ _isConfigured }), Self.isValidHost(presenter),
               activeController?.viewIfLoaded?.window == nil else { return false }
@@ -511,6 +552,7 @@ public final class MySuperwall {
     private var prewarmedController: PaywallWebViewController?
     private var memoryWarningObserver: NSObjectProtocol?
     private var prewarmRefreshScheduled = false
+    private var prewarmValidation = 0
 
     /// Resolves `triggerKey` now and loads its paywall off-screen, so the next `handleTrigger`
     /// that resolves to the same paywall (same id and rendered HTML) presents instantly.
@@ -551,14 +593,21 @@ public final class MySuperwall {
         guard let target = prewarmTarget, locked({ _isConfigured }) else { releasePrewarmedController(); return }
         // Building a second WebView under a visible paywall is wasted memory; refreshed on dismissal.
         guard activeController == nil else { return }
-        let result = resolveTrigger(triggerKey: target.triggerKey, metadata: target.metadata)
-        guard result.show, let paywall = result.paywall else { releasePrewarmedController(); return }
-        if let current = prewarmedController, current.isReusablePrewarm,
-           PrewarmPolicy.canReuse(prepared: current.paywall, for: paywall) { return }
-        releasePrewarmedController()
-        let controller = PaywallWebViewController(paywall: paywall, delegate: nil, prewarmed: true)
-        controller.loadViewIfNeeded()
-        prewarmedController = controller
+        prewarmValidation += 1
+        let validation = prewarmValidation
+        syncDelivery { [weak self] fresh in
+            guard let self = self, validation == self.prewarmValidation, self.activeController == nil,
+                  self.prewarmTarget?.triggerKey == target.triggerKey else { return }
+            guard fresh else { self.releasePrewarmedController(); return }
+            let result = self.resolveTrigger(triggerKey: target.triggerKey, metadata: target.metadata)
+            guard result.show, let paywall = result.paywall else { self.releasePrewarmedController(); return }
+            if let current = self.prewarmedController, current.isReusablePrewarm,
+               PrewarmPolicy.canReuse(prepared: current.paywall, for: paywall) { return }
+            self.releasePrewarmedController()
+            let controller = PaywallWebViewController(paywall: paywall, delegate: nil, prewarmed: true)
+            controller.loadViewIfNeeded()
+            self.prewarmedController = controller
+        }
     }
 
     private func takePrewarmedController(for paywall: PaywallData) -> PaywallWebViewController? {

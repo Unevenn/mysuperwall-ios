@@ -33,6 +33,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     /// until `activatePrewarmed` hands it to a real presentation.
     private var isPrewarming = false
     private var foregroundObserver: NSObjectProtocol?
+    private var backgroundObserver: NSObjectProtocol?
 
     private let messageHandlerName = "MySuperWall"
 
@@ -78,14 +79,28 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
         view.backgroundColor = .black
         setupWebView()
         loadPaywallHtml()
+        backgroundObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in self?.syncContentVisibility(visible: false) }
         foregroundObserver = NotificationCenter.default.addObserver(
             forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
-        ) { [weak self] _ in self?.trackShownIfReady() }
+        ) { [weak self] _ in self?.syncContentVisibility(); self?.trackShownIfReady() }
+    }
+
+    public override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        syncContentVisibility(visible: true)
+    }
+
+    private func syncContentVisibility(visible: Bool? = nil) {
+        let active = (visible ?? (appeared && !isPrewarming && !didNotifyDismiss)) && UIApplication.shared.applicationState == .active
+        webView?.evaluateJavaScript("window.__mySuperWallSetVisible && window.__mySuperWallSetVisible(\(active));", completionHandler: nil)
     }
 
     public override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         appeared = true
+        syncContentVisibility()
         // A page loaded off-screen may not have painted yet; probe again now that it is visible.
         if navigationFinished && !htmlLoaded { requestPaintSignal() }
         trackShownIfReady()
@@ -94,6 +109,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     public override func viewDidDisappear(_ animated: Bool) {
         super.viewDidDisappear(animated)
         appeared = false
+        syncContentVisibility()
         // Covers dismissals not initiated by the page's close action (host code, system).
         // Merely being covered by another presentation is not a dismissal.
         guard isBeingDismissed || isMovingFromParent else { return }
@@ -117,10 +133,11 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
         navigationFinished = true
         report(.ready)
         requestPaintSignal()
+        syncContentVisibility()
     }
 
     private func requestPaintSignal() {
-        webView.evaluateJavaScript("requestAnimationFrame(function(){requestAnimationFrame(function(){window.webkit.messageHandlers.MySuperWall.postMessage({action:'__msw_painted'});});});")
+        webView.evaluateJavaScript("(window.__mySuperWallRequestPaint || requestAnimationFrame)(function(){(window.__mySuperWallRequestPaint || requestAnimationFrame)(function(){window.webkit.messageHandlers.MySuperWall.postMessage({action:'__msw_painted'});});});")
     }
 
     private func trackShownIfReady() {
@@ -137,6 +154,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     public func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { failLoad() }
     private func failLoad() {
         loadFailed = true
+        syncContentVisibility(visible: false)
         report(.failed)
         MySuperwallLogging.warning("Paywall navigation failed.")
     }
@@ -160,6 +178,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
+        contentController.addUserScript(WKUserScript(source: PaywallVisibilityScript.source, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         contentController.addUserScript(userScript)
         contentController.add(WeakScriptMessageHandler(self), name: messageHandlerName)
         configuration.userContentController = contentController
@@ -236,6 +255,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
     }
 
     deinit {
+        if let observer = backgroundObserver { NotificationCenter.default.removeObserver(observer) }
         if let observer = foregroundObserver { NotificationCenter.default.removeObserver(observer) }
         webView?.configuration.userContentController.removeScriptMessageHandler(forName: messageHandlerName)
     }

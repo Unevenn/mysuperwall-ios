@@ -1,11 +1,24 @@
 # MySuperwall iOS SDK (Swift / SPM)
 
+## 1.5.1 delivery and animation fixes (2026-10-30)
+
+Version 1.5.1 introduces the following delivery behavior.
+
+- A cached manifest or prepared WebView is not permission to display. Presentation and prewarming require a successful fresh server decision (a valid manifest 304 can confirm unchanged content). Disabled triggers/paywalls, holdout and failed requests do not fall back to a native/default paywall. Local `resolveTrigger` is a preview, not delivery authorization.
+- Hidden/backgrounded content pauses CSS/Web Animations, `requestAnimationFrame` and media. SDK paint readiness uses native animation frames independently. Custom timers and iframe content require explicit visibility handling through `mysuperwallvisibilitychange`.
+- Keep the existing root presenter/host. Prewarming reduces HTML loading work; it no longer eliminates the validation network request. Dashboard edits apply at the next request, without a push channel closing an already-open screen.
+- Existing native/RN `handleTrigger` call syntax remains supported, but the immediate result is now `validation_pending`. Use the optional `onResult` callback for the final iOS/Android result; in React Native await `handleTriggerAsync` (or use `handleTrigger` with `onResult`). Do not treat the pending result as a reason to show a fallback or report an impression. Flutter `handleTrigger` already returns a Future and continues to be awaited.
+- Before releasing, verify disable/re-enable, repeated opening, foreground/background, and real store purchase/restore/cancellation on device. Unit tests and a simulator build do not verify real billing.
+
+Prewarming reuses loaded content after validation; it does not authorize offline delivery.
+
+
 Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure, evaluate, and display dynamic paywalls in your iOS apps using cached, on-device rule evaluation.
 
 ## Features
 
 - **⚡ Local rule evaluation:** Evaluates audience rules and deterministic A/B variants locally in-memory on the device.
-- **💾 Offline Cache:** Automatically caches active paywall manifests in `UserDefaults` for instant cold starts without network wait.
+- **💾 Offline Cache:** Automatically caches active paywall manifests in `UserDefaults` to reuse content after a successful server validation.
 - **🔄 ETag / 304 Synchronization:** Background sync fetches updates with zero bandwidth waste when rules haven't changed.
 - **🎨 HTML/CSS Dynamic Paywalls:** High-performance `WKWebView` rendering with native JavaScript-to-Swift bridge.
 - **📊 Offline Event Queue:** Fire-and-forget analytics event batching to `POST /paywall/events/batch`.
@@ -15,7 +28,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.5.0**:
+select **Up to Next Major Version** starting at **1.5.1**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -24,7 +37,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.5.0")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.5.1")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
@@ -86,7 +99,7 @@ MySuperwall.initialize(appKey: "YOUR_APP_KEY", locale: "tr")
 
 // 2. Once, when your billing provider has loaded store prices (and again only if they change).
 MySuperwall.shared.setProductData(products) { _ in
-    // 3. Load the main paywall off-screen so the next trigger presents instantly.
+    // 3. Load the main paywall off-screen to reuse it after the next trigger validates.
     MySuperwall.shared.prewarm(triggerKey: "onboarding_finish")
 }
 
@@ -104,7 +117,7 @@ MySuperwall.shared.handleTrigger(presentingController: self, triggerKey: "onboar
   after the prepared paywall has been shown; it is released on memory warnings, `dispose()` and
   `releasePrewarmedPaywall()`. A prepared paywall is used only when the trigger resolves to the
   same paywall with the same rendered HTML; otherwise a fresh one is built as before.
-  `handleTrigger` callbacks, lifecycle states and impression tracking are unchanged; nothing is
+  Purchase/dismiss callbacks, lifecycle states and impression tracking are unchanged; nothing is
   reported for the off-screen preparation itself.
 
 ### 3. User Attributes & Identification
