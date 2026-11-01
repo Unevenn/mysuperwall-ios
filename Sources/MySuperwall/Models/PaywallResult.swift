@@ -26,6 +26,7 @@ public struct PaywallData: Codable, Equatable {
     public let abVariant: String?
     public let experimentContext: ExperimentContext?
     public let attributionUserId: String?
+    public let presentation: PaywallPresentation?
     public let attributionScope: String?
 
     public init(
@@ -38,8 +39,10 @@ public struct PaywallData: Codable, Equatable {
         abVariant: String? = nil,
         experimentContext: ExperimentContext? = nil,
         attributionUserId: String? = nil,
-        attributionScope: String? = nil
+        attributionScope: String? = nil,
+        presentation: PaywallPresentation? = nil
     ) {
+        self.presentation = presentation
         self.id = id
         self.name = name
         self.html = html

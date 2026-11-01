@@ -47,6 +47,8 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
         self.isPrewarming = prewarmed
         super.init(nibName: nil, bundle: nil)
         modalPresentationStyle = .fullScreen
+        transitioningDelegate = self
+        isModalInPresentation = !(paywall.presentation?.dismissable ?? true)
     }
 
     /// A prepared controller that loaded without error and was never handed out.
@@ -60,6 +62,7 @@ public final class PaywallWebViewController: UIViewController, WKScriptMessageHa
         guard isPrewarming else { return }
         self.paywall = paywall
         self.delegate = delegate
+        isModalInPresentation = !(paywall.presentation?.dismissable ?? true)
         isPrewarming = false
         report(.loading)
         if navigationFinished { report(.ready) }

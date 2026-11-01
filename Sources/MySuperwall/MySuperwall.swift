@@ -36,6 +36,15 @@ public final class MySuperwall {
             _paywallStates[key] = state
             return true
         }
+        #if canImport(UIKit)
+        if state == .visible { onMain {
+            self.followUps.recordShown(paywall)
+            if let ticket = self.lifecycleTicket, ticket.0 == paywall.triggerKey {
+                self.lifecycleStatus(ticket.0,"shown","paywall_visible"); self.lifecycleHistory?.shown(ticket.0, occurrence: ticket.1); self.lifecycleTicket = nil
+            }
+            if let offer = self.offerTicket, offer.1 == paywall.id { self.pendingOffers?.shown(offer.0); self.offerTicket = nil }
+        } }
+        #endif
         if changed {
             DispatchQueue.main.async { [weak self] in self?.onPaywallStateChanged?(key, state) }
         }
@@ -44,6 +53,9 @@ public final class MySuperwall {
     public func dispose() {
         #if canImport(UIKit)
         onMain { self.prewarmTarget = nil; self.releasePrewarmedController() }
+        #endif
+        #if canImport(UIKit)
+        onMain { self.stopLifecycleAutomation() }
         #endif
         followUps.reset()
         manifestService.dispose()
@@ -158,6 +170,9 @@ public final class MySuperwall {
         // 1. Switch scope: clears memory first, then loads only this scope's disk entry.
         let scopeChanged = manifestService.activate(scope: scope)
         if scopeChanged || userChanged { followUps.reset() }
+        #if canImport(UIKit)
+        onMain { self.selectLifecycleHistory() }
+        #endif
 
         // 2. Background sync with ETag / 304 validation.
         syncManifest(scope: scope)
@@ -243,6 +258,9 @@ public final class MySuperwall {
         stateLock.lock()
         _subscriptionStatus = status
         stateLock.unlock()
+        #if canImport(UIKit)
+        if status == .active { onMain { self.pendingOffers?.cancelAfterPurchase() } }
+        #endif
     }
 
     /// Set authenticated or persistent user ID
@@ -379,7 +397,8 @@ public final class MySuperwall {
                 abVariant: resolution.abVariant,
                 experimentContext: experimentContext(trigger: trigger, resolution: resolution, paywall: manifestPaywall),
                 attributionUserId: currentUser,
-                attributionScope: manifestService.scope?.cacheKey
+                attributionScope: manifestService.scope?.cacheKey,
+                presentation: manifestPaywall.presentation
             )
 
             return PaywallResult(show: true, paywall: paywallData, reason: resolution.reason)
@@ -421,7 +440,17 @@ public final class MySuperwall {
         if let productId = productId { event["productId"] = productId }
         eventQueue.enqueue(event: event, scope: ManifestScope(baseURL: baseUrl, appKey: appKey, appIdentifier: bundleIdentifier, platform: "ios", lang: "en"))
         flushEventQueue()
+        #if canImport(UIKit)
+        if ["purchase","purchase_success","restore","restore_success"].contains(type.lowercased()) { onMain { self.pendingOffers?.cancelAfterPurchase() } }
+        #endif
         followUps.recordSignal(type: type, paywall: paywall)
+        #if canImport(UIKit)
+        if ["purchase_cancelled","purchase_failed"].contains(type.lowercased()) { onMain {
+            let event = type.lowercased() == "purchase_cancelled" ? "onPurchaseCancelled" : "onPurchaseFailed"
+            if self.manifestService.manifest?.paywalls[paywall.id]?.followUpRules[event]?.enabled == true,
+               self.activeController?.paywall.id == paywall.id { self.dismissActivePaywall() }
+        } }
+        #endif
     }
 
     #if canImport(UIKit)
@@ -438,7 +467,9 @@ public final class MySuperwall {
         onRestore: (() -> Void)? = nil,
         onDismiss: (() -> Void)? = nil,
         onOpenUrl: ((URL) -> Void)? = nil,
-        onResult: ((PaywallResult) -> Void)? = nil
+        onResult: ((PaywallResult) -> Void)? = nil,
+        canPresent: (() -> Bool)? = nil,
+        followUpDepth: Int = 0, followUpChain: [String] = []
     ) -> PaywallResult {
         let reserved = locked { () -> Bool in
             guard _isConfigured, !_presentationPending else { return false }
@@ -452,6 +483,12 @@ public final class MySuperwall {
             return result
         }
         let generation = locked { _configurationGeneration }
+        if !lifecycleHandlersExplicit, let presenter = presentingController, let purchase = onPurchase {
+            installLifecycleHost(presenter,onPurchase: purchase,onRestore: onRestore,onOpenUrl: onOpenUrl,explicit: false)
+        } else if lifecyclePresenter == nil, let presenter = presentingController,
+                  let callbacks = lifecycleCallbacks, let purchase = callbacks.onPurchase {
+            installLifecycleHost(presenter,onPurchase: purchase,onRestore: callbacks.onRestore,onOpenUrl: callbacks.onOpenUrl,explicit: true)
+        }
         syncDelivery { [weak self, weak presentingController] fresh in
             guard let self = self else { return }
             guard self.locked({ self._isConfigured && self._configurationGeneration == generation }) else {
@@ -465,9 +502,13 @@ public final class MySuperwall {
                 onResult?(result.show ? PaywallResult(show: false, reason: "presenter_unavailable") : result)
                 return
             }
+            if let canPresent = canPresent, !canPresent() {
+                self.locked { self._presentationPending = false }
+                onResult?(PaywallResult(show: false, reason: "app_not_ready")); return
+            }
             let callbacks = PaywallCallbacks(onPurchase: onPurchase, onRestore: onRestore,
                                              onDismiss: onDismiss, onOpenUrl: onOpenUrl)
-            let shown = self.presentValidated(paywall: paywall, depth: 0, chain: [paywall.id], presenter: presenter, callbacks: callbacks)
+            let shown = self.presentValidated(paywall: paywall, depth: followUpDepth, chain: followUpChain + [paywall.id], presenter: presenter, callbacks: callbacks)
             if !shown { self.locked { self._presentationPending = false } }
             onResult?(shown ? result : PaywallResult(show: false, reason: "presenter_unavailable"))
         }
@@ -503,13 +544,21 @@ public final class MySuperwall {
     /// Main thread only.
     private func present(paywall: PaywallData, depth: Int, chain: [String],
                          presenter: UIViewController, callbacks: PaywallCallbacks) -> Bool {
+        let reserved = locked { () -> Bool in
+            if _presentationPending { return false }; _presentationPending = true; return true
+        }
+        guard reserved else { return false }
+        let generation = locked { _configurationGeneration }
         syncDelivery { [weak self, weak presenter] fresh in
-            guard let self = self, let presenter = presenter, fresh,
-                  let manifest = self.manifestService.manifest,
-                  let triggerKey = paywall.triggerKey,
-                  manifest.findTrigger(triggerKey) != nil,
-                  let current = manifest.paywalls[paywall.id], current.html == paywall.html else { return }
-            _ = self.presentValidated(paywall: paywall, depth: depth, chain: chain, presenter: presenter, callbacks: callbacks)
+            guard let self = self, self.locked({ self._configurationGeneration == generation }) else { return }
+            guard let presenter = presenter, fresh, let manifest = self.manifestService.manifest,
+                  let triggerKey = paywall.triggerKey, manifest.findTrigger(triggerKey) != nil,
+                  let current = manifest.paywalls[paywall.id], current.html == paywall.html else {
+                self.locked { self._presentationPending = false }; return
+            }
+            if !self.presentValidated(paywall: paywall, depth: depth, chain: chain, presenter: presenter, callbacks: callbacks) {
+                self.locked { self._presentationPending = false }
+            }
         }
         return true
     }
@@ -525,7 +574,11 @@ public final class MySuperwall {
             self.activeController = nil
             self.locked { self._presentationPending = false }
             self.schedulePrewarmRefresh()
-            self.followUps.sessionDidClose(
+            let event = session.pendingEvent?.rawValue ?? "onDismiss"
+            if let rule = self.manifestService.manifest?.paywalls[paywall.id]?.followUpRules[event], rule.enabled,
+               rule.timingMode != nil, let history = self.lifecycleHistory {
+                self.pendingOffers?.enqueue(source: paywall.id,event: event,rule: rule,metrics: history.state,depth: depth,seen: chain)
+            } else { self.followUps.sessionDidClose(
                 session,
                 hostValid: { MySuperwall.isValidHost(presenter) },
                 present: { [weak self] next in
@@ -533,7 +586,7 @@ public final class MySuperwall {
                     return self.present(paywall: next.paywall, depth: next.depth, chain: next.chain,
                                         presenter: presenter, callbacks: callbacks)
                 }
-            )
+            ) }
         }
         let warm = takePrewarmedController(for: paywall)
         let controller = warm ?? PaywallWebViewController(paywall: paywall, delegate: delegate)
@@ -544,6 +597,118 @@ public final class MySuperwall {
         warm?.activatePrewarmed(paywall: paywall, delegate: delegate)
         presenter.present(controller, animated: true, completion: nil)
         return true
+    }
+
+    private var pendingOffers: PendingFollowUps?
+    private var offerTicket: (String,String)?
+    private var lifecycleHistory: LifecycleHistory?
+    private var lifecycleScope: String?
+    private weak var lifecyclePresenter: UIViewController?
+    private var lifecycleHandlersExplicit = false
+    private var lifecycleCallbacks: PaywallCallbacks?
+    private var lifecycleTimer: Timer?
+    private var lifecycleObservers: [NSObjectProtocol] = []
+    private var lifecycleReady = true
+    private var lifecycleForeground = false
+    private var lifecycleTicket: (String, Double)?
+
+    /// Call once on the main thread with your existing application billing service.
+    public func setLifecycleHost(_ presenter: UIViewController, onPurchase: @escaping (String) -> Void,
+                                 onRestore: (() -> Void)? = nil, onOpenUrl: ((URL) -> Void)? = nil) {
+        installLifecycleHost(presenter,onPurchase: onPurchase,onRestore: onRestore,onOpenUrl: onOpenUrl,explicit: true)
+    }
+    private func installLifecycleHost(_ presenter: UIViewController,onPurchase: @escaping (String)->Void,
+                                      onRestore: (()->Void)?,onOpenUrl: ((URL)->Void)?,explicit: Bool) {
+        onMain { [self] in
+            self.lifecycleHandlersExplicit = explicit
+            self.stopLifecycleAutomation()
+            self.lifecyclePresenter = presenter
+            self.lifecycleCallbacks = PaywallCallbacks(onPurchase: onPurchase, onRestore: onRestore, onDismiss: nil, onOpenUrl: onOpenUrl)
+            for name in [UIApplication.didBecomeActiveNotification, UIApplication.willResignActiveNotification] {
+                self.lifecycleObservers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                    guard let self = self else { return }
+                    if notification.name == UIApplication.willResignActiveNotification {
+                        self.lifecycleHistory?.pause(); self.lifecycleForeground = false
+                    } else { self.evaluateLifecycle() }
+                })
+            }
+            self.lifecycleTimer = Timer.scheduledTimer(withTimeInterval: 15, repeats: true) { [weak self] _ in self?.evaluateLifecycle() }
+            self.evaluateLifecycle()
+        }
+    }
+    public func setLifecycleReady(_ ready: Bool) { onMain { self.lifecycleReady = ready; if ready { self.evaluateLifecycle() } } }
+    private func stopLifecycleAutomation() {
+        lifecycleTimer?.invalidate(); lifecycleTimer = nil
+        lifecycleObservers.forEach { NotificationCenter.default.removeObserver($0) }; lifecycleObservers = []
+        lifecycleHistory?.pause(); lifecycleForeground = false; lifecyclePresenter = nil; lifecycleCallbacks = nil
+    }
+    private var lifecycleDiagnostics: [String:String] = [:]
+    private func lifecycleStatus(_ key: String,_ status: String,_ reason: String) {
+        let signature = status + ":" + reason
+        if lifecycleDiagnostics[key] == signature { return }; lifecycleDiagnostics[key] = signature
+        let event: [String:Any] = ["type":"lifecycle_status","eventId":UUID().uuidString,"userId":userId ?? "","triggerKey":key,
+            "metadata":["lifecycle_status":status,"reason":reason]]
+        eventQueue.enqueue(event: event,scope: ManifestScope(baseURL: baseUrl,appKey: appKey,appIdentifier: bundleIdentifier,platform: "ios",lang: "en")); flushEventQueue()
+    }
+    private var lifecycleRefreshAt: Double = 0
+    private func selectLifecycleHistory() {
+        let scope = [baseUrl, appKey ?? "", bundleIdentifier ?? "", userId ?? ""].joined(separator: "|")
+        if lifecycleScope != scope {
+            lifecycleDiagnostics.removeAll(); lifecycleRefreshAt = 0
+            lifecycleScope = scope; lifecycleTicket = nil; offerTicket = nil
+            pendingOffers = PendingFollowUps(defaults: userDefaults, scope: scope)
+            lifecycleHistory = LifecycleHistory(defaults: userDefaults, scope: scope,
+                version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+            lifecycleForeground = false
+        }
+    }
+    private func evaluateLifecycle() {
+        guard locked({ _isConfigured }) else { return }
+        selectLifecycleHistory()
+        guard let history = lifecycleHistory else { return }
+        let foreground = UIApplication.shared.applicationState == .active
+        if foreground != lifecycleForeground { if foreground { history.resume() } else { history.pause() }; lifecycleForeground = foreground }
+        guard foreground else { return }
+        if foreground && Date().timeIntervalSince1970 - lifecycleRefreshAt >= 60 {
+            lifecycleRefreshAt = Date().timeIntervalSince1970
+            syncDelivery { [weak self] _ in if self?.lifecycleForeground == true { self?.evaluateLifecycle() } }
+        }
+        let priorities = Dictionary((manifestService.manifest?.triggers ?? []).map { ($0.key, $0.prewarmPriority ?? 0) }, uniquingKeysWith: max)
+        history.tick(keys: Array(priorities.keys))
+        for key in history.state.pending.keys {
+            if lifecycleDiagnostics[key] == nil { lifecycleStatus(key,"received","sdk_signal") }
+            if priorities[key] == nil { lifecycleStatus(key,"pending","trigger_not_found") }
+            else if !lifecycleReady { lifecycleStatus(key,"pending","app_not_ready") }
+        }
+        guard foreground, lifecycleReady, !locked({ _presentationPending }), let presenter = lifecyclePresenter,
+              let callbacks = lifecycleCallbacks else { return }
+        if manifestService.manifest != nil, let offer = pendingOffers?.eligible(metrics: history.state, premium: subscriptionStatus == .active,
+            current: { self.manifestService.manifest?.paywalls[$0]?.followUpRules[$1] }).first, let targetKey = offer.rule.triggerKey {
+            _ = handleTrigger(presentingController: presenter, triggerKey: targetKey,
+                onPurchase: callbacks.onPurchase, onRestore: callbacks.onRestore, onOpenUrl: callbacks.onOpenUrl,
+                onResult: { [weak self] result in if result.show, let id = result.paywall?.id { self?.offerTicket = (offer.id,id) } },
+                canPresent: { [weak self, weak history] in
+                    guard let self = self, let history = history, self.lifecycleHistory === history, self.lifecycleReady,
+                          UIApplication.shared.applicationState == .active,
+                          self.manifestService.manifest?.paywalls[offer.source]?.followUpRules[offer.event] == offer.rule,
+                          let target = self.resolveTrigger(triggerKey: targetKey).paywall,
+                          !(offer.rule.skipIfPremium && self.subscriptionStatus == .active) else { return false }
+                    guard self.pendingOffers?.eligible(metrics: history.state, premium: self.subscriptionStatus == .active,
+                        current: { self.manifestService.manifest?.paywalls[$0]?.followUpRules[$1] }).contains(where: { $0.id == offer.id }) == true else { return false }
+                    return !offer.rule.preventRepeatPaywall || !offer.seen.contains(target.id)
+                }, followUpDepth: offer.depth + 1, followUpChain: offer.seen)
+            return
+        }
+        guard let key = history.candidates(priorities: priorities).first, let at = history.state.pending[key] else { return }
+        lifecycleStatus(key,"matched","trigger_configured")
+        lifecycleTicket = (key, at)
+        _ = handleTrigger(presentingController: presenter, triggerKey: key,
+            onPurchase: callbacks.onPurchase, onRestore: callbacks.onRestore, onOpenUrl: callbacks.onOpenUrl,
+            onResult: { [weak self] result in if !result.show { self?.lifecycleStatus(key,"pending",result.reason ?? "no_display"); self?.lifecycleTicket = nil } },
+            canPresent: { [weak self, weak history] in
+                guard let self = self else { return false }
+                return self.lifecycleReady && self.lifecycleHistory === history && UIApplication.shared.applicationState == .active
+            })
     }
 
     // MARK: Prewarm (single slot, main thread only)

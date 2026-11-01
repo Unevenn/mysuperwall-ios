@@ -162,6 +162,7 @@ public final class ManifestService {
         }
 
         var body: [String: Any] = ["platform": "ios", "lang": requested.lang]
+        body["sdkCapabilities"] = ["deferred_follow_up_v1"]
         body["substitutionData"] = substitutionData
         if let ak = appKey, !ak.isEmpty { body["appKey"] = ak }
         if let bid = bundleId, !bid.isEmpty { body["bundleId"] = bid }

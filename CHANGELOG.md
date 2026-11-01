@@ -1,3 +1,13 @@
+## 1.6.0 — 2026-11-01
+
+- Add persistent automatic lifecycle signals, readiness gating, foreground-only
+  active time and 30-day deferred evaluation, with visibility-based completion.
+- Add durable minute/session/foreground follow-up policies and lifecycle debugger reasons.
+- Distinguish purchase cancellation, preserve disabled-rule intent, and guard overlapping delivery.
+- Add shared presentation configuration, smooth custom transitions, reduced motion and instant open/close.
+- Keep existing billing APIs and document updated-source integration separately from published releases.
+- Device billing, motion smoothness and long-running timed delivery remain unverified.
+
 ## 1.5.1 - 2026-10-30
 
 - Revalidate before presentation/prewarming and stop cached or native fallback delivery when a trigger/paywall is disabled or the server cannot be reached.

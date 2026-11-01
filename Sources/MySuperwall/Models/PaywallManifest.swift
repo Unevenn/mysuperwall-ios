@@ -131,6 +131,14 @@ public struct ManifestPaywallProduct: Codable, Equatable {
 /// Automatic follow-up configuration carried in a paywall's `contentJson.followUpRules`.
 /// Only `actionType == "trigger"` is supported; other action types are ignored.
 public struct ManifestFollowUpRule: Codable, Equatable {
+    public let timingMode: String?
+    public let waitMinutes: Int?
+    public let minSessions: Int?
+    public let minDays: Int?
+    public let excludeFirstSession: Bool?
+    public let expiresMinutes: Int?
+    public let maxShowsPerDay: Int?
+    public let cancelOnPurchase: Bool?
     public let enabled: Bool
     public let actionType: String
     public let triggerKey: String?
@@ -150,8 +158,24 @@ public struct ManifestFollowUpRule: Codable, Equatable {
         cooldownMs: Int = 0,
         maxChainDepth: Int = 2,
         skipIfPremium: Bool = false,
-        preventRepeatPaywall: Bool = true
+        preventRepeatPaywall: Bool = true,
+        timingMode: String? = nil,
+        waitMinutes: Int? = nil,
+        minSessions: Int? = nil,
+        minDays: Int? = nil,
+        excludeFirstSession: Bool? = nil,
+        expiresMinutes: Int? = nil,
+        maxShowsPerDay: Int? = nil,
+        cancelOnPurchase: Bool? = nil
     ) {
+        self.timingMode = timingMode
+        self.waitMinutes = waitMinutes
+        self.minSessions = minSessions
+        self.minDays = minDays
+        self.excludeFirstSession = excludeFirstSession
+        self.expiresMinutes = expiresMinutes
+        self.maxShowsPerDay = maxShowsPerDay
+        self.cancelOnPurchase = cancelOnPurchase
         self.enabled = enabled
         self.actionType = actionType
         self.triggerKey = triggerKey
@@ -165,6 +189,7 @@ public struct ManifestFollowUpRule: Codable, Equatable {
 
     private enum CodingKeys: String, CodingKey {
         case enabled, actionType, triggerKey, delayMs, oncePerSession
+        case timingMode, waitMinutes, minSessions, minDays, excludeFirstSession, expiresMinutes, maxShowsPerDay, cancelOnPurchase
         case cooldownMs, maxChainDepth, skipIfPremium, preventRepeatPaywall
     }
 
@@ -188,7 +213,15 @@ public struct ManifestFollowUpRule: Codable, Equatable {
             cooldownMs: max(0, int(.cooldownMs, 0)),
             maxChainDepth: max(0, int(.maxChainDepth, 2)),
             skipIfPremium: bool(.skipIfPremium, false),
-            preventRepeatPaywall: bool(.preventRepeatPaywall, true)
+            preventRepeatPaywall: bool(.preventRepeatPaywall, true),
+            timingMode: try? c.decodeIfPresent(String.self, forKey: .timingMode),
+            waitMinutes: try? c.decodeIfPresent(Int.self, forKey: .waitMinutes),
+            minSessions: try? c.decodeIfPresent(Int.self, forKey: .minSessions),
+            minDays: try? c.decodeIfPresent(Int.self, forKey: .minDays),
+            excludeFirstSession: try? c.decodeIfPresent(Bool.self, forKey: .excludeFirstSession),
+            expiresMinutes: try? c.decodeIfPresent(Int.self, forKey: .expiresMinutes),
+            maxShowsPerDay: try? c.decodeIfPresent(Int.self, forKey: .maxShowsPerDay),
+            cancelOnPurchase: try? c.decodeIfPresent(Bool.self, forKey: .cancelOnPurchase)
         )
     }
 }
@@ -202,10 +235,12 @@ private struct LossyFollowUpRule: Codable {
 }
 
 private struct PaywallContentJson: Codable {
+    var presentation: PaywallPresentation? = nil
     let followUpRules: [String: LossyFollowUpRule]?
 }
 
 public struct ManifestPaywall: Codable, Equatable {
+    public let presentation: PaywallPresentation?
     public let publishedVersion: Int?
     public let id: String
     public let name: String
@@ -224,8 +259,10 @@ public struct ManifestPaywall: Codable, Equatable {
         productIds: [String] = [],
         products: [ManifestPaywallProduct] = [],
         publishedVersion: Int? = nil,
-        followUpRules: [String: ManifestFollowUpRule] = [:]
+        followUpRules: [String: ManifestFollowUpRule] = [:],
+        presentation: PaywallPresentation? = nil
     ) {
+        self.presentation = presentation
         self.publishedVersion = publishedVersion
         self.id = id
         self.name = name
@@ -250,6 +287,7 @@ public struct ManifestPaywall: Codable, Equatable {
         productIds = try c.decodeIfPresent([String].self, forKey: .productIds) ?? []
         products = try c.decodeIfPresent([ManifestPaywallProduct].self, forKey: .products) ?? []
         let content = (try? c.decodeIfPresent(PaywallContentJson.self, forKey: .contentJson)) ?? nil
+        presentation = content?.presentation
         followUpRules = (content?.followUpRules ?? [:]).compactMapValues { $0.rule }
     }
 
@@ -262,8 +300,8 @@ public struct ManifestPaywall: Codable, Equatable {
         try c.encode(html, forKey: .html)
         try c.encode(productIds, forKey: .productIds)
         try c.encode(products, forKey: .products)
-        if !followUpRules.isEmpty {
-            try c.encode(PaywallContentJson(followUpRules: followUpRules.mapValues(LossyFollowUpRule.init)), forKey: .contentJson)
+        if !followUpRules.isEmpty || presentation != nil {
+            try c.encode(PaywallContentJson(presentation: presentation, followUpRules: followUpRules.mapValues(LossyFollowUpRule.init)), forKey: .contentJson)
         }
     }
 }

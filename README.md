@@ -1,3 +1,5 @@
+> **1.6.0 (2026-11-01):** Lifecycle history, deferred follow-up offers and expanded motion. Use this version for the new APIs below. Existing billing remains app-owned. Device billing and motion verification are not implied by publication.
+
 # MySuperwall iOS SDK (Swift / SPM)
 
 ## 1.5.1 delivery and animation fixes (2026-10-30)
@@ -28,7 +30,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.5.1**:
+select **Up to Next Major Version** starting at **1.6.0**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -37,7 +39,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.5.1")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.6.0")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
@@ -281,3 +283,57 @@ Log levels: `all`, `warning` (default), `error`, `none`. States: `idle`, `loadin
 `ready`, `presenting`, `visible`, `dismissed`, `failed`. The `baseUrl` initialization
 argument was removed; remove it from existing integrations. Impressions require
 WebView paint readiness and a visible, foreground presentation.
+
+## 1.6.0 lifecycle, follow-up and motion update (2026-11-01)
+
+This section describes the 1.6.0 release. Registry publication is verified separately in the release record. Keep using your existing billing provider and report confirmed
+purchase, cancellation, failure and restore outcomes separately. Button taps are
+not purchase success. Configure products/prices before displaying a paywall.
+
+Automatic signals: first SDK initialization (not the store installation date),
+app version change, each session, foreground returns, `mysuperwall.session_N`,
+`mysuperwall.day_N` and `mysuperwall.active_minutes_N`. Initialization starts a
+session; returning after at least 30 minutes in the background starts another.
+Active minutes exclude background time. Signals remain pending for 30 days and
+are consumed only after an actual visible impression. Creating a trigger later
+can match retained history. Network failures and missing triggers retain eligible
+signals. Configured prewarm priority, occurrence time and key determine selection.
+
+The mounted host waits for billing handlers. Manual presentation can supply these
+handlers for subsequent automatic presentation while that host is valid; register
+an application-level handler explicitly for automatic presentation before the first
+manual paywall. Pause readiness during onboarding/login, and resume it afterward.
+No billing or purchase callbacks are serialized to disk.
+
+Published follow-up policies support immediate, elapsed minutes, active-use minutes,
+next session and next foreground; minimum days/sessions, first-session exclusion,
+expiry, daily caps, premium/repeat/chain safeguards and cancellation after confirmed
+purchase/restore. Pending advanced offers are scoped to application and SDK user.
+The source policy is checked again before presentation. The SDK advertises
+`deferred_follow_up_v1`; older package versions must not claim this capability.
+The app must return to foreground with a valid host; no OS background alarm or
+cross-device offer synchronization is provided.
+
+Presentation styles: `system`, `none`, `slide_left`, `slide_up`, `slide_down`,
+`fade`, `scale_up`, `scale_down`, `fade_slide_up`, `from_left`. `none` opens and
+closes instantly. Custom transitions support 0–4000ms and the configured curve,
+including `smooth` and `easeInOutCubic`. Reduced-motion preferences are respected.
+`dismissable: false` blocks user/system dismissal, but app/template close actions
+remain available. Hidden WebView content still uses the existing visibility policy.
+
+Expected no-display results such as a missing lifecycle trigger are diagnostics,
+not application errors. The debugger receives `lifecycle_status` reasons.
+
+These changes are not production/device verified. Test fresh launch, onboarding,
+background/foreground, process restart, purchase/cancel/restore and delayed offers
+on Android and iOS before publishing an application or SDK release.
+
+```swift
+// Main thread; keep the presenter and application billing service alive.
+MySuperwall.shared.setLifecycleHost(rootController,
+    onPurchase: { productId in billing.purchase(productId) },
+    onRestore: { billing.restore() })
+MySuperwall.shared.setLifecycleReady(false) // onboarding/login
+// Once ready:
+MySuperwall.shared.setLifecycleReady(true)
+```

@@ -89,7 +89,7 @@ final class FollowUpTests: XCTestCase {
 
     func close(_ s: FollowUpSession) {
         controller.sessionDidClose(s, hostValid: { [unowned self] in self.hostIsValid },
-                                   present: { [unowned self] p in self.presented.append(p); return true })
+                                   present: { [unowned self] p in self.presented.append(p); self.controller.recordShown(p.paywall); return true })
         scheduler.runAll()
     }
 
@@ -108,7 +108,7 @@ final class FollowUpTests: XCTestCase {
         let s = open("pw_a", trigger: "main")
         XCTAssertTrue(presented.isEmpty, "nothing may present while the first paywall is still up")
         close(s)
-        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); return true })
+        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); self.controller.recordShown(p.paywall); return true })
         scheduler.runAll()
 
         XCTAssertEqual(presented.count, 1, "close is processed once")
@@ -153,12 +153,12 @@ final class FollowUpTests: XCTestCase {
 
     func testDisabledOrUnsupportedRuleFallsBackAsExpected() {
         let legacy = ManifestDismissAction(type: "follow_up_paywall", followUpPaywallId: "pw_legacy")
-        // Disabled explicit rule -> legacy applies.
+        // Explicitly disabled rule must not resurrect legacy recovery.
         makeController(
             paywalls: [paywall("pw_a", rules: ["onDismiss": rule(enabled: false)]), paywall("pw_legacy")],
             triggers: [trigger("main", paywall: "pw_a", dismiss: legacy)])
         close(open("pw_a", trigger: "main"))
-        XCTAssertEqual(presented.map { $0.paywall.id }, ["pw_legacy"])
+        XCTAssertTrue(presented.isEmpty)
 
         // Enabled rule with unsupported actionType -> nothing (explicit still wins, no silent legacy).
         makeController(
@@ -173,7 +173,7 @@ final class FollowUpTests: XCTestCase {
             paywalls: [paywall("pw_a", rules: ["onDismiss": rule(delayMs: 1500)]), paywall("pw_f")],
             triggers: [trigger("main", paywall: "pw_a"), trigger("t_follow", paywall: "pw_f")])
         let s = open("pw_a", trigger: "main")
-        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); return true })
+        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); self.controller.recordShown(p.paywall); return true })
         XCTAssertEqual(scheduler.jobs.first?.delay, 1.5)
         XCTAssertEqual(scheduler.liveCount, 1)
 
@@ -188,7 +188,7 @@ final class FollowUpTests: XCTestCase {
             paywalls: [paywall("pw_a", rules: ["onDismiss": rule(delayMs: 10)]), paywall("pw_f")],
             triggers: [trigger("main", paywall: "pw_a"), trigger("t_follow", paywall: "pw_f")])
         let s = open("pw_a", trigger: "main")
-        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); return true })
+        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); self.controller.recordShown(p.paywall); return true })
         let work = scheduler.jobs[0].work
         controller.reset()
         work() // simulates a callback that was already dequeued
@@ -197,7 +197,7 @@ final class FollowUpTests: XCTestCase {
         // A session opened before the reset can't present after it either.
         let old = open("pw_a", trigger: "main")
         controller.reset()
-        controller.sessionDidClose(old, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); return true })
+        controller.sessionDidClose(old, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); self.controller.recordShown(p.paywall); return true })
         scheduler.runAll()
         XCTAssertTrue(presented.isEmpty)
     }
@@ -230,7 +230,7 @@ final class FollowUpTests: XCTestCase {
             paywalls: [paywall("pw_a", rules: ["onDismiss": rule(delayMs: 100, skipPremium: true)]), paywall("pw_f")],
             triggers: [trigger("main", paywall: "pw_a"), trigger("t_follow", paywall: "pw_f")])
         let s = open("pw_a", trigger: "main")
-        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); return true })
+        controller.sessionDidClose(s, hostValid: { true }, present: { [unowned self] p in self.presented.append(p); self.controller.recordShown(p.paywall); return true })
         premium = true // host reports the entitlement during the delay
         scheduler.runAll()
         XCTAssertTrue(presented.isEmpty)
@@ -274,10 +274,10 @@ final class FollowUpTests: XCTestCase {
     // MARK: Purchase / restore signals
 
     func testButtonTapEventsDoNotArmPurchaseFollowUps() {
-        for type in ["purchase_started", "restore_started", "paywall_shown", "paywall_dismissed", "purchase_cancelled"] {
+        for type in ["purchase_started", "restore_started", "paywall_shown", "paywall_dismissed"] {
             XCTAssertNil(FollowUpEvent.fromTrackedType(type), type)
         }
-        for type in ["purchase", "purchase_success", "purchase_failed", "restore", "restore_success", "PURCHASE_SUCCESS"] {
+        for type in ["purchase", "purchase_success", "purchase_failed", "restore", "restore_success", "purchase_cancelled", "PURCHASE_SUCCESS"] {
             XCTAssertNotNil(FollowUpEvent.fromTrackedType(type), type)
         }
     }

@@ -11,6 +11,7 @@ public enum SubscriptionStatus: Equatable {
 enum FollowUpEvent: String {
     case dismiss = "onDismiss"
     case purchase = "onPurchase"
+    case purchaseCancelled = "onPurchaseCancelled"
     case purchaseFailed = "onPurchaseFailed"
     case restore = "onRestore"
 
@@ -18,6 +19,7 @@ enum FollowUpEvent: String {
     static func fromTrackedType(_ type: String) -> FollowUpEvent? {
         switch type.lowercased() {
         case "purchase", "purchase_success": return .purchase
+        case "purchase_cancelled": return .purchaseCancelled
         case "purchase_failed": return .purchaseFailed
         case "restore", "restore_success": return .restore
         default: return nil
@@ -78,6 +80,7 @@ final class FollowUpController {
     private let lock = NSLock()
     private var epoch = 0
     private var active: FollowUpSession?
+    private var pendingUsage: (target: String,key: String,epoch: Int)?
     private var firedKeys = Set<String>()
     private var lastFired = [String: Date]()
     private var scheduled = [UUID: () -> Void]()
@@ -91,6 +94,7 @@ final class FollowUpController {
         lock.lock()
         epoch += 1
         active = nil
+        pendingUsage = nil
         firedKeys.removeAll()
         lastFired.removeAll()
         let cancels = Array(scheduled.values)
@@ -105,6 +109,7 @@ final class FollowUpController {
         lock.lock()
         let session = FollowUpSession(paywall: paywall, depth: depth, chain: chain ?? [paywall.id], epoch: epoch)
         active = session
+        if depth == 0 { pendingUsage = nil }
         let cancels = Array(scheduled.values)
         scheduled.removeAll()
         lock.unlock()
@@ -183,6 +188,7 @@ final class FollowUpController {
         }
 
         if let rule = enabledRule(event) {
+            if rule.timingMode != nil { return nil }
             // An enabled explicit rule always takes precedence over the legacy root action.
             guard rule.actionType.lowercased() == "trigger",
                   let key = rule.triggerKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
@@ -191,7 +197,7 @@ final class FollowUpController {
             return Plan(event: event, source: .rule(rule), delayMs: rule.delayMs)
         }
 
-        guard event == .dismiss, session.depth == 0,
+        guard rules[event.rawValue] == nil, event == .dismiss, session.depth == 0,
               let triggerKey = session.paywall.triggerKey,
               let action = manifest.findTrigger(triggerKey)?.dismissAction,
               action.type.lowercased() == "follow_up_paywall",
@@ -238,7 +244,8 @@ final class FollowUpController {
                 productIds: resolved.productIds, products: resolved.products,
                 triggerKey: triggerKey, abVariant: nil, experimentContext: nil,
                 attributionUserId: session.paywall.attributionUserId,
-                attributionScope: session.paywall.attributionScope
+                attributionScope: session.paywall.attributionScope,
+                presentation: resolved.presentation
             )
             preventRepeat = rule.preventRepeatPaywall
 
@@ -249,7 +256,8 @@ final class FollowUpController {
                 productIds: mp.productIds, products: mp.products,
                 triggerKey: session.paywall.triggerKey, abVariant: nil, experimentContext: nil,
                 attributionUserId: session.paywall.attributionUserId,
-                attributionScope: session.paywall.attributionScope
+                attributionScope: session.paywall.attributionScope,
+                presentation: mp.presentation
             )
             preventRepeat = true
         }
@@ -261,11 +269,14 @@ final class FollowUpController {
         lock.unlock()
         guard stillLive else { return }
 
-        if present(FollowUpPresentation(paywall: target, depth: depth, chain: session.chain + [target.id])) {
-            lock.lock()
-            firedKeys.insert(key)
-            lastFired[key] = env.now()
-            lock.unlock()
+        lock.lock(); pendingUsage = (target.id,key,epoch); lock.unlock()
+        if !present(FollowUpPresentation(paywall: target, depth: depth, chain: session.chain + [target.id])) {
+            lock.lock(); pendingUsage = nil; lock.unlock()
         }
+    }
+    func recordShown(_ paywall: PaywallData) {
+        lock.lock(); defer { lock.unlock() }
+        guard let pending = pendingUsage, pending.epoch == epoch, pending.target == paywall.id else { return }
+        firedKeys.insert(pending.key); lastFired[pending.key] = env.now(); pendingUsage = nil
     }
 }
