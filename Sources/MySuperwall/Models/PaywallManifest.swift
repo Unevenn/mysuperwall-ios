@@ -78,6 +78,22 @@ public struct ManifestDismissAction: Codable, Equatable {
     }
 }
 
+/// When a lifecycle trigger may start. Absent on older manifests.
+public struct ManifestSchedule: Codable, Equatable {
+    public let fromOpen: Int?
+    public let delaySeconds: Int?
+}
+
+/// Per-user display limits. Absent on older manifests; zero means no limit.
+public struct ManifestDisplayLimit: Codable, Equatable {
+    public let maxPerUser: Int?
+    public let minIntervalHours: Int?
+    public let maxPerPeriod: Int?
+    public let period: String?
+    public let stopAfterDismissals: Int?
+    public let hideForPurchasers: Bool?
+}
+
 public struct ManifestTrigger: Codable, Equatable {
     public let experimentId: String?
     public let experimentVersion: String?
@@ -90,6 +106,8 @@ public struct ManifestTrigger: Codable, Equatable {
     public let variants: [ManifestVariant]
     public let rules: [ManifestRule]
     public let dismissAction: ManifestDismissAction?
+    public let schedule: ManifestSchedule?
+    public let displayLimit: ManifestDisplayLimit?
 
     public init(
         id: String,
@@ -102,8 +120,12 @@ public struct ManifestTrigger: Codable, Equatable {
         dismissAction: ManifestDismissAction? = nil,
         experimentId: String? = nil,
         experimentVersion: String? = nil,
-        audienceId: String? = nil
+        audienceId: String? = nil,
+        schedule: ManifestSchedule? = nil,
+        displayLimit: ManifestDisplayLimit? = nil
     ) {
+        self.schedule = schedule
+        self.displayLimit = displayLimit
         self.experimentId = experimentId
         self.experimentVersion = experimentVersion
         self.audienceId = audienceId

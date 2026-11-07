@@ -1,3 +1,20 @@
+## 1.7.0 — 2026-11-07
+
+- Add `trackPurchaseSuccess`, `trackPurchaseFailed`, `trackPurchaseCancelled` and
+  `trackRestoreSuccess`. `onPurchase` only carries a product ID, so reporting used to
+  need a paywall object that automatic paywalls never provided. The SDK now attributes
+  results to the paywall whose button was tapped. Passing a store transaction ID lets
+  the server count one purchase once. `trackPaywallEvent` keeps working.
+- Apply dashboard display limits to custom triggers on the device. These limits
+  were not enforced by this SDK before. `handleTrigger` now returns
+  `display_limit` without a request when a limit is reached.
+- Apply lifecycle trigger schedules and display limits on the device: start
+  open, wait, repeat interval, total and period caps, closes without buying and
+  hiding from subscribers. Blocked opens make no request. The manifest refreshes
+  at most every 10 minutes instead of every minute, a trigger that did not show
+  is not retried on every tick, and `lifecycle_status` diagnostics are limited to
+  eligible triggers plus one daily activity signal.
+
 ## 1.6.0 — 2026-11-01
 
 - Add persistent automatic lifecycle signals, readiness gating, foreground-only

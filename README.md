@@ -1,4 +1,4 @@
-> **1.6.0 (2026-11-01):** Lifecycle history, deferred follow-up offers and expanded motion. Use this version for the new APIs below. Existing billing remains app-owned. Device billing and motion verification are not implied by publication.
+> **1.7.0 (2026-11-07):** Device-side lifecycle schedules and display limits, with purchase-result reporting for automatic paywalls. Existing billing remains app-owned.
 
 # MySuperwall iOS SDK (Swift / SPM)
 
@@ -30,7 +30,7 @@ Native Swift SDK for [MySuperwall](https://mysuperwall.com). Remotely configure,
 ### Swift Package Manager
 
 In Xcode, choose **File → Add Package Dependencies**, paste the URL below, and
-select **Up to Next Major Version** starting at **1.6.0**:
+select **Up to Next Major Version** starting at **1.7.0**:
 
 ```text
 https://github.com/Unevenn/mysuperwall-ios
@@ -39,7 +39,7 @@ https://github.com/Unevenn/mysuperwall-ios
 Add the `MySuperwall` library to your app target. In a Swift package manifest:
 
 ```swift
-.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.6.0")
+.package(url: "https://github.com/Unevenn/mysuperwall-ios", from: "1.7.0")
 ```
 
 The target dependency is `.product(name: "MySuperwall", package: "mysuperwall-ios")`.
@@ -147,11 +147,19 @@ must call `trackPaywallEvent` when they actually show the paywall.
 
 Purchase and restore button requests record `purchase_started` and
 `restore_started`, not successful transactions. After your billing provider confirms
-a purchase, pass the **original displayed paywall** to the SDK:
+a purchase, report it. The SDK attributes it to the paywall whose button was tapped:
 
+```swift
+MySuperwall.shared.trackPurchaseSuccess(productId: productId, storeTransactionId: String(transaction.id))
+MySuperwall.shared.trackPurchaseCancelled(productId: productId)  // the user closed the store sheet
+MySuperwall.shared.trackPurchaseFailed(productId: productId, errorMessage: code)  // a billing error
+MySuperwall.shared.trackRestoreSuccess()
 ```
-MySuperwall.shared.trackPaywallEvent(type: "purchase_success", paywall: displayedPaywall, productId: productId)
-```
+
+A pending payment reports nothing until it completes. These require the SDK version
+1.7.0 or later. On older versions, keep the paywall from `onResult` and call
+`trackPaywallEvent(type: "purchase_success", paywall: displayedPaywall, productId: productId)`;
+automatic paywalls provide no paywall object there.
 
 Do not resolve the trigger again to attribute a completed purchase. An identity
 change invalidates attribution from the previous user's paywall. Offline retries
